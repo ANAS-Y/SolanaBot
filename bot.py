@@ -126,9 +126,23 @@ async def process_risk(message: types.Message, state: FSMContext):
 
 @dp.message(BotStates.trade_pin)
 async def process_pin(message: types.Message, state: FSMContext):
+    # 1. Try to get the wallet from the DB
     wallet = await db.get_wallet(message.from_user.id)
+
+    # 2. SAFETY CHECK: If wallet is missing (Render wiped DB), stop here.
+    if not wallet:
+        await message.answer("⚠️ **Wallet Not Found!**\n\n"
+                             "Since you are on Render Free Tier, the database resets on every restart.\n"
+                             "Please create a new wallet using /create_wallet")
+        await state.clear()
+        return
+
+    # 3. If wallet exists, proceed to decrypt
     decrypted = decrypt_key(wallet[0], wallet[1], message.text.strip())
-    if not decrypted: return await message.answer("❌ Wrong PIN.")
+    
+    if not decrypted: 
+        return await message.answer("❌ Wrong PIN.")
+    
     ACTIVE_SESSIONS[message.from_user.id] = Keypair.from_bytes(decrypted)
     await execute_trade(message, state)
 
