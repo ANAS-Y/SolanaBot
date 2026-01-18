@@ -15,39 +15,52 @@ JUP_SWAP = "https://quote-api.jup.ag/v6/swap"
 JUP_PRICE = "https://api.jup.ag/price/v2"
 SOL_MINT = "So11111111111111111111111111111111111111112"
 
-# --- DNS OVER HTTPS (DoH) RESOLVER ---
+# --- DNS OVER HTTPS (DoH) WITH IP BOOTSTRAP ---
 class DoHResolver(aiohttp.resolver.AbstractResolver):
     """
-    Resolves DNS via Cloudflare HTTPS API. 
-    Bypasses all local DNS/UDP blocking on Render.
+    Resolves DNS via Cloudflare's IP (1.1.1.1).
+    This bypasses system DNS entirely.
     """
     async def resolve(self, host, port=0, family=socket.AF_INET):
-        # 1. Ask Cloudflare via HTTPS (Looks like regular web traffic)
-        url = f"https://cloudflare-dns.com/dns-query?name={host}&type=A"
+        # We connect to 1.1.1.1 directly so we don't need to resolve 'cloudflare-dns.com'
+        url = f"https://1.1.1.1/dns-query?name={host}&type=A"
         headers = {"Accept": "application/dns-json"}
         
         try:
-            async with aiohttp.ClientSession() as session:
+            # ssl=False is required here because we are connecting to an IP (1.1.1.1)
+            # but the certificate is for 'cloudflare-dns.com'.
+            async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
                 async with session.get(url, headers=headers) as resp:
                     if resp.status == 200:
-                        # FIX: Disable strict content-type check
                         data = await resp.json(content_type=None)
-                        
                         if "Answer" in data:
-                            # Grab the first IP address found
                             ip = data["Answer"][0]["data"]
                             return [{'hostname': host, 'host': ip, 'port': port,
                                      'family': family, 'proto': 0, 'flags': 0}]
         except Exception as e:
-            logging.error(f"DoH Error: {e}")
+            logging.error(f"DoH Bootstrap Error: {e}")
 
-        # Fallback to local DNS if DoH fails (unlikely)
+        # If 1.1.1.1 fails, try Google's IP (8.8.8.8) as backup
+        try:
+            url_backup = f"https://8.8.8.8/resolve?name={host}&type=A"
+            async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
+                async with session.get(url_backup) as resp:
+                    if resp.status == 200:
+                        data = await resp.json(content_type=None)
+                        if "Answer" in data:
+                            ip = data["Answer"][0]["data"]
+                            return [{'hostname': host, 'host': ip, 'port': port,
+                                     'family': family, 'proto': 0, 'flags': 0}]
+        except:
+            pass
+
+        # Final fallback (unlikely to work if system DNS is broken, but required by code structure)
         return await aiohttp.resolver.ThreadedResolver().resolve(host, port, family)
 
     async def close(self): pass
 
 def get_conn():
-    # Use our custom DoH resolver
+    # Use our custom IP-based DoH resolver
     return aiohttp.TCPConnector(resolver=DoHResolver(), ssl=False)
 
 async def retry_request(url, method="GET", payload=None):
@@ -57,7 +70,6 @@ async def retry_request(url, method="GET", payload=None):
                 if method == "GET":
                     async with session.get(url, timeout=10) as resp:
                         if resp.status == 200: 
-                            # Also disable strict check here just in case
                             return await resp.json(content_type=None)
                         elif resp.status == 429: await asyncio.sleep(2)
                         else: logging.warning(f"⚠️ HTTP {resp.status} from {url}")
@@ -74,7 +86,6 @@ async def retry_request(url, method="GET", payload=None):
 # --- BALANCE & TRADING ---
 async def get_sol_balance(rpc_url, pubkey_str):
     try:
-        # RPC calls use standard connection (AsyncClient handles it)
         async with AsyncClient(rpc_url) as client:
             resp = await client.get_balance(Pubkey.from_string(pubkey_str))
             return resp.value
