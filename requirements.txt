@@ -6,3 +6,4 @@ asyncpg
 cryptography
 base58
 python-dotenv
+mnemonic
