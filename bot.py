@@ -15,18 +15,16 @@ RPC_URL = os.getenv("RPC_URL", "https://api.mainnet-beta.solana.com")
 
 if not BOT_TOKEN:
     logging.error("❌ ERROR: Missing BOT_TOKEN")
-    # We don't exit to prevent Render crash loops, but bot won't work.
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from solders.keypair import Keypair 
 from solders.pubkey import Pubkey
 from solders.system_program import TransferParams, transfer
-from solders.transaction import VersionedTransaction
-from solders.message import to_bytes_versioned
+from solana.transaction import Transaction
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.types import TxOpts
 from cryptography.fernet import Fernet
@@ -222,9 +220,6 @@ async def execute_transfer(message, state):
         dest_pubkey = Pubkey.from_string(data['dest'])
         
         async with AsyncClient(RPC_URL) as client:
-            # Get latest blockhash
-            latest_blockhash = await client.get_latest_blockhash()
-            
             # Build Transfer TX
             ix = transfer(
                 TransferParams(
@@ -234,17 +229,7 @@ async def execute_transfer(message, state):
                 )
             )
             
-            # Compile Message
-            msg_obj =  to_bytes_versioned(VersionedTransaction(
-                to_bytes_versioned(VersionedTransaction(
-                   # Standard transfer usually legacy, but let's just use simple construction
-                   # For simplicity in 'solders' we can use a simpler approach if Versioned is tricky
-                   pass # Placeholder logic, simplifying below for reliability
-                ).message)
-            ).message)
-            
-            # Simplified Transaction Logic for Transfer (Reliable)
-            from solana.transaction import Transaction
+            # Create Transaction Object
             txn = Transaction().add(ix)
             
             # Send
