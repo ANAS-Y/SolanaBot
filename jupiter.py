@@ -3,7 +3,6 @@ import base64
 import logging
 import socket
 import asyncio
-import json
 from solders.transaction import VersionedTransaction
 from solders.message import to_bytes_versioned
 from solana.rpc.async_api import AsyncClient
@@ -27,16 +26,21 @@ class DoHResolver(aiohttp.resolver.AbstractResolver):
         url = f"https://cloudflare-dns.com/dns-query?name={host}&type=A"
         headers = {"Accept": "application/dns-json"}
         
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if "Answer" in data:
-                        # Grab the first IP address found
-                        ip = data["Answer"][0]["data"]
-                        return [{'hostname': host, 'host': ip, 'port': port,
-                                 'family': family, 'proto': 0, 'flags': 0}]
-        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers) as resp:
+                    if resp.status == 200:
+                        # FIX: Disable strict content-type check
+                        data = await resp.json(content_type=None)
+                        
+                        if "Answer" in data:
+                            # Grab the first IP address found
+                            ip = data["Answer"][0]["data"]
+                            return [{'hostname': host, 'host': ip, 'port': port,
+                                     'family': family, 'proto': 0, 'flags': 0}]
+        except Exception as e:
+            logging.error(f"DoH Error: {e}")
+
         # Fallback to local DNS if DoH fails (unlikely)
         return await aiohttp.resolver.ThreadedResolver().resolve(host, port, family)
 
@@ -52,12 +56,15 @@ async def retry_request(url, method="GET", payload=None):
             async with aiohttp.ClientSession(connector=get_conn()) as session:
                 if method == "GET":
                     async with session.get(url, timeout=10) as resp:
-                        if resp.status == 200: return await resp.json()
+                        if resp.status == 200: 
+                            # Also disable strict check here just in case
+                            return await resp.json(content_type=None)
                         elif resp.status == 429: await asyncio.sleep(2)
                         else: logging.warning(f"⚠️ HTTP {resp.status} from {url}")
                 elif method == "POST":
                     async with session.post(url, json=payload, timeout=10) as resp:
-                        if resp.status == 200: return await resp.json()
+                        if resp.status == 200: 
+                            return await resp.json(content_type=None)
                         else: logging.error(f"⚠️ POST Error {resp.status}")
         except Exception as e:
             logging.warning(f"⚠️ Network Attempt {attempt+1} failed: {e}")
