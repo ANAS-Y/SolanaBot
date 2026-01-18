@@ -2,7 +2,7 @@ aiogram>=3.4.1
 solana==0.32.0
 solders==0.20.0
 aiohttp
-aiosqlite
+asyncpg
 cryptography
 base58
 python-dotenv
