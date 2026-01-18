@@ -2,6 +2,7 @@ aiogram>=3.4.1
 solana==0.32.0
 solders==0.20.0
 aiohttp
+aiodns
 asyncpg
 cryptography
 base58
