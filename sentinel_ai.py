@@ -3,12 +3,14 @@ import logging
 import json
 import config
 
-# We use the direct REST API endpoint for Gemini 1.5 Flash (Fast & Free)
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={}"
+# --- CONFIGURATION ---
+# We use 'gemini-pro' because it is the STABLE model for the v1beta endpoint.
+# This fixes the 404 error you are seeing.
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={}"
 
 async def analyze_token(ca, safety_status, market_data):
     """
-    Sends data to Gemini AI via Direct REST API (Bypassing the broken SDK).
+    Sends data to Gemini Pro via Direct REST API.
     """
     if not config.GEMINI_API_KEY:
         return "WAIT", "⚠️ Gemini API Key missing."
@@ -51,26 +53,40 @@ async def analyze_token(ca, safety_status, market_data):
     # 3. SEND DIRECT REQUEST
     try:
         url = GEMINI_URL.format(config.GEMINI_API_KEY)
+        
+        # We use a 30-second timeout to give the AI enough time to think
         async with httpx.AsyncClient() as client:
-            resp = await client.post(url, json=payload, timeout=10)
+            resp = await client.post(url, json=payload, timeout=30.0)
             
             if resp.status_code != 200:
                 logging.error(f"Gemini API Error {resp.status_code}: {resp.text}")
                 return "WAIT", f"Google API Error: {resp.status_code}"
 
             data = resp.json()
-            # Extract text from complex JSON response
-            try:
-                text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-            except (KeyError, IndexError):
-                return "WAIT", "AI returned empty response."
-
-            # Parse Decision
-            if text.startswith("BUY"): return "BUY", text[3:].strip("- :")
-            if text.startswith("AVOID"): return "AVOID", text[5:].strip("- :")
-            if text.startswith("WAIT"): return "WAIT", text[4:].strip("- :")
             
-            return "WAIT", text
+            # Robust Parsing Logic
+            try:
+                if "candidates" in data and data["candidates"]:
+                    content = data["candidates"][0].get("content", {})
+                    parts = content.get("parts", [])
+                    if parts:
+                        text = parts[0].get("text", "").strip()
+                    else:
+                        return "WAIT", "AI returned empty text."
+                else:
+                    return "WAIT", "AI returned no candidates."
+            except Exception as e:
+                logging.error(f"Parsing Error: {e} | Data: {str(data)[:200]}")
+                return "WAIT", "AI Response Parse Error."
+
+            # Parse Decision (Case Insensitive)
+            upper_text = text.upper()
+            if upper_text.startswith("BUY"): return "BUY", text[3:].strip("- :")
+            if upper_text.startswith("AVOID"): return "AVOID", text[5:].strip("- :")
+            if upper_text.startswith("WAIT"): return "WAIT", text[4:].strip("- :")
+            
+            # Fallback
+            return "WAIT", text[:100]
 
     except Exception as e:
         logging.error(f"Gemini Connection Error: {e}")
