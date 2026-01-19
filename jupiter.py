@@ -1,8 +1,7 @@
-import aiohttp
+import httpx
 import base64
 import logging
 import asyncio
-import socket
 import json
 from solders.transaction import VersionedTransaction
 from solders.message import to_bytes_versioned
@@ -11,101 +10,48 @@ from solana.rpc.types import TxOpts
 from solders.pubkey import Pubkey
 
 # --- CONFIGURATION ---
-JUP_QUOTE_HOST = "quote-api.jup.ag"
-JUP_PRICE_HOST = "api.jup.ag"
-JUP_QUOTE_URL = f"https://{JUP_QUOTE_HOST}/v6/quote"
-JUP_SWAP_URL = f"https://{JUP_QUOTE_HOST}/v6/swap"
-JUP_PRICE_URL = f"https://{JUP_PRICE_HOST}/price/v2"
+JUP_QUOTE_URL = "https://quote-api.jup.ag/v6/quote"
+JUP_SWAP_URL = "https://quote-api.jup.ag/v6/swap"
+JUP_PRICE_URL = "https://api.jup.ag/price/v2"
 
 SOL_MINT = "So11111111111111111111111111111111111111112"
 
-# --- DYNAMIC NETWORK RESOLVER ---
-
-# Global cache to store the fresh IPs once we find them
-IP_CACHE = {}
-
-async def fetch_fresh_ip(hostname):
-    """
-    Asks Google DNS (8.8.8.8) for the latest IP of a hostname.
-    Bypasses system DNS.
-    """
-    if hostname in IP_CACHE: return IP_CACHE[hostname]
-    
-    # We ask Google (8.8.8.8) directly via HTTPS
-    doh_url = f"https://8.8.8.8/resolve?name={hostname}&type=A"
-    
-    try:
-        # ssl=False is required to connect to 8.8.8.8 via IP
-        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
-            async with session.get(doh_url, timeout=5) as resp:
-                if resp.status == 200:
-                    data = await resp.json(content_type=None)
-                    if "Answer" in data:
-                        # Get the last IP in the list (usually the most reliable)
-                        fresh_ip = data["Answer"][-1]["data"]
-                        logging.info(f"🌍 Resolved {hostname} -> {fresh_ip}")
-                        IP_CACHE[hostname] = fresh_ip
-                        return fresh_ip
-    except Exception as e:
-        logging.error(f"❌ DNS Lookup Failed for {hostname}: {e}")
-        
-    # Fallback to a known Cloudflare IP if Google fails (Emergency Backup)
-    return "104.18.40.155" 
-
-class DynamicResolver(aiohttp.resolver.AbstractResolver):
-    """
-    Injects the dynamically fetched IP into the connection
-    while keeping the Hostname for SSL verification.
-    """
-    async def resolve(self, host, port=0, family=socket.AF_INET):
-        # 1. Get the fresh IP (either from cache or by asking Google)
-        target_ip = await fetch_fresh_ip(host)
-        
-        # 2. Return the mapping
-        return [{
-            'hostname': host,
-            'host': target_ip,
-            'port': port,
-            'family': family,
-            'proto': 0,
-            'flags': 0
-        }]
-
-    async def close(self): pass
-
-def get_conn():
-    # Use the Dynamic Resolver
-    return aiohttp.TCPConnector(resolver=DynamicResolver())
+# --- NETWORK ENGINE (HTTPX) ---
+# We use a single client for connection pooling
+# verify=False bypasses the SSL/DNS mismatches on Render
+CLIENT = httpx.AsyncClient(verify=False, timeout=10.0, follow_redirects=True)
 
 async def retry_request(url, method="GET", payload=None):
+    """
+    Uses HTTPX with SSL verification DISABLED.
+    This bypasses the handshake failures and DNS strictness.
+    """
     for attempt in range(3):
         try:
-            async with aiohttp.ClientSession(connector=get_conn()) as session:
-                if method == "GET":
-                    async with session.get(url, timeout=10) as resp:
-                        if resp.status == 200: 
-                            return await resp.json(content_type=None)
-                        elif resp.status == 530:
-                            # 530 means IP is bad. Clear cache to force new lookup next time.
-                            logging.warning("⚠️ 530 Origin Error. Clearing DNS Cache.")
-                            IP_CACHE.clear()
-                        else:
-                            logging.warning(f"⚠️ HTTP {resp.status} from {url}")
-                elif method == "POST":
-                    async with session.post(url, json=payload, timeout=10) as resp:
-                        if resp.status == 200: 
-                            return await resp.json(content_type=None)
-                        else:
-                            logging.error(f"⚠️ POST Error {resp.status}")
+            if method == "GET":
+                resp = await CLIENT.get(url)
+            elif method == "POST":
+                resp = await CLIENT.post(url, json=payload)
+            
+            # Check for success
+            if resp.status_code == 200:
+                return resp.json()
+            elif resp.status_code == 429:
+                # Rate limit - wait and retry
+                await asyncio.sleep(2)
+            else:
+                logging.warning(f"⚠️ HTTP {resp.status_code} from {url}: {resp.text[:100]}")
+                
         except Exception as e:
-            logging.warning(f"⚠️ Request Failed: {e}")
+            logging.warning(f"⚠️ Network Attempt {attempt+1} failed: {str(e)}")
             await asyncio.sleep(1)
+            
     return None
 
 # --- BALANCE & TRADING ---
 async def get_sol_balance(rpc_url, pubkey_str):
     try:
-        # Use standard client for RPC (Alchemy/Helius usually work fine)
+        # RPC calls use standard library (AsyncClient handles connection)
         async with AsyncClient(rpc_url) as client:
             resp = await client.get_balance(Pubkey.from_string(pubkey_str))
             return resp.value
@@ -133,7 +79,8 @@ async def execute_swap(keypair, input_mint, output_mint, amount_lamports, rpc_ur
     # 1. Quote
     q_url = f"{JUP_QUOTE_URL}?inputMint={input_mint}&outputMint={output_mint}&amount={int(amount_lamports)}&slippageBps={slippage}"
     quote = await retry_request(q_url)
-    if not quote: return "Quote Error: Connection Failed"
+    
+    if not quote: return "Quote Error: Connection Failed (Check Logs)"
     if "error" in quote: return f"Quote Error: {quote['error']}"
 
     # 2. Swap
@@ -144,7 +91,9 @@ async def execute_swap(keypair, input_mint, output_mint, amount_lamports, rpc_ur
         "prioritizationFeeLamports": 10000 
     }
     swap_resp = await retry_request(JUP_SWAP_URL, method="POST", payload=payload)
-    if not swap_resp or "swapTransaction" not in swap_resp: return f"Swap Error: {swap_resp}"
+    
+    if not swap_resp: return "Swap Error: No Response"
+    if "swapTransaction" not in swap_resp: return f"Swap Error: {swap_resp}"
 
     # 3. Sign
     try:
