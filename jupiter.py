@@ -2,6 +2,7 @@ import aiohttp
 import base64
 import logging
 import asyncio
+import socket
 from solders.transaction import VersionedTransaction
 from solders.message import to_bytes_versioned
 from solana.rpc.async_api import AsyncClient
@@ -11,94 +12,76 @@ from solders.pubkey import Pubkey
 # --- CONFIGURATION ---
 JUP_QUOTE_HOST = "quote-api.jup.ag"
 JUP_PRICE_HOST = "api.jup.ag"
+JUP_QUOTE_URL = f"https://{JUP_QUOTE_HOST}/v6/quote"
+JUP_SWAP_URL = f"https://{JUP_QUOTE_HOST}/v6/swap"
+JUP_PRICE_URL = f"https://{JUP_PRICE_HOST}/price/v2"
+
+# Cloudflare IPs for Jupiter (Hardcoded to bypass DNS)
+HARDCODED_IPS = {
+    JUP_QUOTE_HOST: "172.67.163.67",  # Primary Cloudflare IP
+    JUP_PRICE_HOST: "104.21.32.127"   # Secondary Cloudflare IP
+}
+
 SOL_MINT = "So11111111111111111111111111111111111111112"
 
-# --- ROBUST NETWORK RESOLVER ---
-
-async def resolve_ip_robust(hostname):
+# --- NETWORK HARDENING: HARDCODED RESOLVER ---
+class HardcodedResolver(aiohttp.resolver.AbstractResolver):
     """
-    Tries 3 methods to find the IP address.
-    1. Google DoH (IP 8.8.8.8)
-    2. Cloudflare DoH (IP 1.1.1.1)
-    3. Hardcoded Fallback (The 'Nuclear' Option)
+    A resolver that ignores the network and returns hardcoded IPs.
+    This fixes DNS failures while preserving SSL SNI.
     """
-    
-    # Method 1: Google DNS via IP
-    try:
-        url = f"https://8.8.8.8/resolve?name={hostname}&type=A"
-        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
-            async with session.get(url, timeout=3) as resp:
-                if resp.status == 200:
-                    data = await resp.json(content_type=None)
-                    if "Answer" in data:
-                        return data["Answer"][0]["data"]
-    except:
-        pass # Silently fail to next method
+    async def resolve(self, host, port=0, family=socket.AF_INET):
+        # 1. Check if we have a hardcoded IP for this host
+        if host in HARDCODED_IPS:
+            return [{
+                'hostname': host,
+                'host': HARDCODED_IPS[host],
+                'port': port,
+                'family': family,
+                'proto': 0,
+                'flags': 0
+            }]
+        
+        # 2. Fallback: If it's not Jupiter, try standard resolution (e.g. for RPC)
+        return await aiohttp.resolver.ThreadedResolver().resolve(host, port, family)
 
-    # Method 2: Cloudflare DNS via IP
-    try:
-        url = f"https://1.1.1.1/dns-query?name={hostname}&type=A"
-        headers = {"Accept": "application/dns-json"}
-        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
-            async with session.get(url, headers=headers, timeout=3) as resp:
-                if resp.status == 200:
-                    data = await resp.json(content_type=None)
-                    if "Answer" in data:
-                        return data["Answer"][0]["data"]
-    except:
-        pass
+    async def close(self): pass
 
-    # Method 3: Hardcoded Fallback (Current Cloudflare IPs for Jupiter)
-    # These are accurate as of 2026.
-    logging.warning(f"⚠️ DNS Failed. Using Hardcoded IP for {hostname}")
-    return "172.67.163.67" # Primary Cloudflare IP
+def get_conn():
+    # We pass the HardcodedResolver to the connector.
+    # We set ssl=True (Default) because now we are using the real Hostname, so SSL checks will pass!
+    return aiohttp.TCPConnector(resolver=HardcodedResolver())
 
 async def retry_request(url, method="GET", payload=None):
-    """
-    Connects DIRECTLY to the resolved IP, injecting the correct Host header.
-    """
-    # 1. Determine Hostname
-    if "quote-api" in url: hostname = JUP_QUOTE_HOST
-    elif "api.jup" in url: hostname = JUP_PRICE_HOST
-    else: return None
-
-    # 2. Resolve IP (With Triple Fallback)
-    target_ip = await resolve_ip_robust(hostname)
-    
-    # 3. Build Direct URL
-    # Replaces 'quote-api.jup.ag' with '172.67.163.67'
-    direct_url = url.replace(hostname, target_ip)
-    
-    # 4. Headers (Crucial for SSL verification to pass on the server side)
-    headers = {"Host": hostname}
-
-    # 5. Send Request
     for attempt in range(3):
         try:
-            # ssl=False is MANDATORY when connecting to an IP directly
-            async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
+            # We use the standard URL (e.g. https://quote-api.jup.ag)
+            # The Magic happens in 'get_conn()' which maps it to the IP internally.
+            async with aiohttp.ClientSession(connector=get_conn()) as session:
                 if method == "GET":
-                    async with session.get(direct_url, headers=headers, timeout=10) as resp:
+                    async with session.get(url, timeout=10) as resp:
                         if resp.status == 200: 
+                            # Disable strict content-type check just to be safe
                             return await resp.json(content_type=None)
-                        elif resp.status == 403:
-                            # 403 Forbidden usually means Cloudflare blocked the direct IP access
-                            # In this specific case, we try one more IP if the first one failed
-                            logging.warning("⚠️ 403 Forbidden on primary IP. Trying secondary...")
-                            direct_url = url.replace(hostname, "104.21.32.127") # Secondary IP
-                            continue
+                        elif resp.status == 429: 
+                            await asyncio.sleep(2)
+                        else:
+                            logging.warning(f"⚠️ HTTP {resp.status} from {url}")
                 elif method == "POST":
-                    async with session.post(direct_url, json=payload, headers=headers, timeout=10) as resp:
+                    async with session.post(url, json=payload, timeout=10) as resp:
                         if resp.status == 200: 
                             return await resp.json(content_type=None)
+                        else:
+                            logging.error(f"⚠️ POST Error {resp.status}")
         except Exception as e:
-            logging.warning(f"⚠️ Request Failed: {e}")
+            logging.warning(f"⚠️ Attempt {attempt+1} Failed: {e}")
             await asyncio.sleep(1)
     return None
 
 # --- BALANCE & TRADING ---
 async def get_sol_balance(rpc_url, pubkey_str):
     try:
+        # RPC calls use standard library (AsyncClient handles connection)
         async with AsyncClient(rpc_url) as client:
             resp = await client.get_balance(Pubkey.from_string(pubkey_str))
             return resp.value
@@ -108,7 +91,7 @@ async def get_sol_balance(rpc_url, pubkey_str):
 
 async def get_market_cap(mint, rpc_url):
     try:
-        price_data = await retry_request(f"https://{JUP_PRICE_HOST}/price/v2?ids={mint}")
+        price_data = await retry_request(f"{JUP_PRICE_URL}?ids={mint}")
         if not price_data or 'data' not in price_data: return None
         price = float(price_data['data'][mint]['price'])
 
@@ -118,15 +101,15 @@ async def get_market_cap(mint, rpc_url):
     except: return None
 
 async def get_price(mint):
-    data = await retry_request(f"https://{JUP_PRICE_HOST}/price/v2?ids={mint}")
+    data = await retry_request(f"{JUP_PRICE_URL}?ids={mint}")
     try: return float(data['data'][mint]['price'])
     except: return None
 
 async def execute_swap(keypair, input_mint, output_mint, amount_lamports, rpc_url, slippage=100):
     # 1. Quote
-    q_url = f"https://{JUP_QUOTE_HOST}/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={int(amount_lamports)}&slippageBps={slippage}"
+    q_url = f"{JUP_QUOTE_URL}?inputMint={input_mint}&outputMint={output_mint}&amount={int(amount_lamports)}&slippageBps={slippage}"
     quote = await retry_request(q_url)
-    if not quote: return "Quote Error: Connection Failed (Check Logs)"
+    if not quote: return "Quote Error: Connection Failed"
     if "error" in quote: return f"Quote Error: {quote['error']}"
 
     # 2. Swap
@@ -136,7 +119,7 @@ async def execute_swap(keypair, input_mint, output_mint, amount_lamports, rpc_ur
         "wrapAndUnwrapSol": True,
         "prioritizationFeeLamports": 10000 
     }
-    swap_resp = await retry_request(f"https://{JUP_QUOTE_HOST}/v6/swap", method="POST", payload=payload)
+    swap_resp = await retry_request(JUP_SWAP_URL, method="POST", payload=payload)
     if not swap_resp or "swapTransaction" not in swap_resp: return f"Swap Error: {swap_resp}"
 
     # 3. Sign
