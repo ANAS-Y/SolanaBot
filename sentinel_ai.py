@@ -5,7 +5,8 @@ import logging
 # Configure Gemini
 if config.GEMINI_API_KEY:
     genai.configure(api_key=config.GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-pro')
+    # UPDATED MODEL NAME: gemini-1.5-flash is the current standard for fast/free tier
+    model = genai.GenerativeModel('gemini-1.5-flash')
 else:
     model = None
 
@@ -17,7 +18,6 @@ async def analyze_token(ca, safety_status, market_data):
         return "WAIT", "⚠️ Gemini API Key missing."
 
     # 1. HARD RULES (Pre-Filter)
-    # Even AI can hallucinate, so we enforce hard constraints first.
     if safety_status == "UNSAFE":
         return "AVOID", "⛔ RugCheck failed."
     
@@ -55,11 +55,11 @@ async def analyze_token(ca, safety_status, market_data):
         response = await model.generate_content_async(prompt)
         text = response.text.strip()
         
-        # Simple parsing (Gemini usually returns clean text if instructed well)
+        # Simple parsing
         if "BUY" in text: return "BUY", text
         if "AVOID" in text: return "AVOID", text
         return "WAIT", text
 
     except Exception as e:
         logging.error(f"Gemini Error: {e}")
-        return "WAIT", "AI Unreachable"
+        return "WAIT", f"AI Error: {str(e)}"

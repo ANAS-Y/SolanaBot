@@ -5,6 +5,8 @@ import sys
 import config 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from aiohttp import web
 
@@ -19,13 +21,13 @@ logging.basicConfig(level=logging.INFO)
 
 # --- CONFIG CHECK ---
 if not config.BOT_TOKEN:
-    logging.critical("❌ BOT_TOKEN is missing! Check Render Environment Variables.")
+    logging.critical("CRITICAL: BOT_TOKEN is missing in Render Environment!")
     sys.exit(1)
 
 bot = Bot(token=config.BOT_TOKEN)
 dp = Dispatcher()
 
-# --- WEB SERVER (REQUIRED FOR RENDER) ---
+# --- WEB SERVER (Render Requirement) ---
 async def health_check(request):
     return web.Response(text="Sentinel AI is running", status=200)
 
@@ -38,120 +40,179 @@ async def start_web_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logging.info(f"🌍 Web Server started on port {port}")
+    logging.info(f"Web Server started on port {port}")
 
-# --- MENUS ---
+# --- STATES ---
+class BotStates(StatesGroup):
+    waiting_for_token = State()
+
+# --- MENUS (The UI) ---
+
+def get_launch_menu():
+    """The initial Start Button"""
+    kb = [[KeyboardButton(text="🚀 Launch App")]]
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
 def get_main_menu():
+    """The Main Dashboard"""
     kb = [
-        [KeyboardButton(text="🧠 Analyze Token (AI)"), KeyboardButton(text="💰 Wallet Balance")],
-        [KeyboardButton(text="⚙️ Settings"), KeyboardButton(text="📊 Active Positions")]
+        [KeyboardButton(text="🧠 AI Analysis"), KeyboardButton(text="🛡️ Safety Check")],
+        [KeyboardButton(text="💰 My Wallet"), KeyboardButton(text="📊 Active Trades")]
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
-# --- COMMAND HANDLERS ---
+def get_cancel_menu():
+    """Universal Cancel Button"""
+    kb = [[KeyboardButton(text="❌ Cancel Operation")]]
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
+# --- START FLOW ---
+
 @dp.message(Command("start"))
-async def start(message: types.Message):
+async def start(message: types.Message, state: FSMContext):
+    await state.clear()
     await db.init_db()
-    await message.answer(
-        "👁️ **Sentinel AI Online**\n\n"
-        "I am your autonomous crypto agent.\n"
-        "I analyze Solana tokens using Google Gemini AI and check for scams via RugCheck.",
-        reply_markup=get_main_menu()
+    # Clean Welcome Message
+    welcome_text = (
+        "Welcome to Sentinel AI\n"
+        "──────────────────\n"
+        "Your autonomous crypto trading agent.\n"
+        "Powered by Google Gemini & RugCheck.\n\n"
+        "Tap below to begin."
     )
+    await message.answer(welcome_text, reply_markup=get_launch_menu())
 
-@dp.message(Command("help"))
-async def help_command(message: types.Message):
-    await message.answer(
-        "**Sentinel AI Help**\n\n"
-        "1. Click **🧠 Analyze Token**\n"
-        "2. Paste a Solana Contract Address (CA)\n"
-        "3. Wait for the AI Verdict (Buy/Wait/Avoid)\n\n"
-        "Commands:\n"
-        "/start - Restart Bot\n"
-        "/status - Check active trades",
-        reply_markup=get_main_menu()
+@dp.message(F.text == "🚀 Launch App")
+async def launch_app(message: types.Message, state: FSMContext):
+    await state.clear()
+    text = (
+        "Main Menu\n"
+        "──────────────────\n"
+        "Select an option below to proceed:"
     )
+    await message.answer(text, reply_markup=get_main_menu())
 
-# --- AI ANALYSIS FLOW ---
-@dp.message(F.text == "🧠 Analyze Token (AI)")
-async def analyze_ask(message: types.Message):
-    await message.answer("📝 **Paste the Token Contract Address (CA) now:**")
+# --- CANCEL HANDLER (Universal) ---
+@dp.message(F.text == "❌ Cancel Operation")
+async def cancel_op(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Operation cancelled. Returning to menu.", reply_markup=get_main_menu())
 
-# This filter detects Solana Addresses (Long strings with no spaces)
-@dp.message(lambda x: len(x.text) > 30 and " " not in x.text)
-async def run_sentinel_agent(message: types.Message):
+# --- FEATURE: AI ANALYSIS ---
+
+@dp.message(F.text == "🧠 AI Analysis")
+async def analyze_start(message: types.Message, state: FSMContext):
+    text = (
+        "New Analysis\n"
+        "──────────────────\n"
+        "Please paste the Token Contract Address below.\n\n"
+        "Hint: It usually looks like a long string of random letters."
+    )
+    await message.answer(text, reply_markup=get_cancel_menu())
+    await state.set_state(BotStates.waiting_for_token)
+
+@dp.message(BotStates.waiting_for_token)
+async def analyze_process(message: types.Message, state: FSMContext):
     ca = message.text.strip()
-    status_msg = await message.answer(f"🔎 **Sentinel AI is analyzing...**\n`{ca}`")
+    
+    # Basic Validation
+    if len(ca) < 30 or " " in ca:
+        await message.answer("That does not look like a valid address. Please try again.", reply_markup=get_cancel_menu())
+        return
+
+    # Status Message
+    status = await message.answer("🔎 Scanning network...", reply_markup=get_cancel_menu())
 
     # 1. Safety Check
-    try:
-        await status_msg.edit_text("🛡️ Checking Safety (RugCheck.xyz)...")
-        safety_verdict, safety_reason = await data_engine.get_rugcheck_report(ca)
-        
-        if safety_verdict == "UNSAFE":
-            await status_msg.edit_text(f"⛔ **BLOCKED**\nReason: {safety_reason}")
-            return
-    except Exception as e:
-        await status_msg.edit_text(f"⚠️ Error during Safety Check: {e}")
+    await status.edit_text("🛡️ Checking RugCheck safety database...")
+    safety_verdict, safety_reason = await data_engine.get_rugcheck_report(ca)
+    
+    if safety_verdict == "UNSAFE":
+        await status.edit_text(
+            f"⛔ BLOCKED: Unsafe Token\n"
+            f"──────────────────\n"
+            f"Reason: {safety_reason}\n\n"
+            f"The AI will not analyze this token to protect your funds."
+        )
+        await state.clear()
+        # Re-show menu after a short delay or immediately
+        await message.answer("Select an option:", reply_markup=get_main_menu())
         return
 
     # 2. Market Data
-    try:
-        await status_msg.edit_text("📊 Fetching Market Data...")
-        market_data = await data_engine.get_market_data(ca)
-        if not market_data:
-            await status_msg.edit_text("❌ Error fetching market data. Token might be too new.")
-            return
-    except Exception as e:
-        await status_msg.edit_text(f"⚠️ Error during Market Data fetch: {e}")
+    await status.edit_text("📊 Fetching live market data...")
+    market_data = await data_engine.get_market_data(ca)
+    if not market_data:
+        await status.edit_text("❌ Error: Could not fetch market data. The token might be too new.")
+        await state.clear()
         return
 
     # 3. AI Analysis
-    try:
-        await status_msg.edit_text("🧠 Gemini AI is thinking...")
-        decision, reason = await sentinel_ai.analyze_token(ca, safety_verdict, market_data)
+    await status.edit_text("🧠 Gemini AI is analyzing price action...")
+    decision, reason = await sentinel_ai.analyze_token(ca, safety_verdict, market_data)
 
-        emoji = "🟢" if decision == "BUY" else "🟡" if decision == "WAIT" else "🔴"
-        await status_msg.edit_text(
-            f"{emoji} **Decision: {decision}**\n\n"
-            f"**Safety:** {safety_reason}\n"
-            f"**Liquidity:** ${market_data['liquidity']:,.0f}\n"
-            f"**AI Reasoning:**\n_{reason}_"
-        )
-    except Exception as e:
-        await status_msg.edit_text(f"⚠️ AI Error: {e}")
+    # 4. Final Output (Clean Formatting)
+    emoji = "🟢" if decision == "BUY" else "🟡" if decision == "WAIT" else "🔴"
+    
+    result_text = (
+        f"{emoji} Verdict: {decision}\n"
+        f"──────────────────\n"
+        f"Safety Status: {safety_reason}\n"
+        f"Liquidity: ${market_data['liquidity']:,.0f}\n"
+        f"Volume (5m): ${market_data['volume_5m']:,.0f}\n\n"
+        f"AI Reasoning:\n"
+        f"{reason}"
+    )
+    
+    await status.edit_text(result_text)
+    await message.answer("Select an option:", reply_markup=get_main_menu())
+    await state.clear()
 
-# --- WALLET HANDLERS ---
-@dp.message(F.text == "💰 Wallet Balance")
-async def check_balance(message: types.Message):
+# --- FEATURE: WALLET ---
+
+@dp.message(F.text == "💰 My Wallet")
+async def check_wallet(message: types.Message):
     wallet = await db.get_wallet(message.from_user.id)
-    if not wallet: 
-        return await message.answer("❌ No wallet found. Please create one.")
+    if not wallet:
+        await message.answer(
+            "No wallet connected.\n"
+            "Go to ⚙️ Settings to create or import one.",
+            reply_markup=get_main_menu()
+        )
+        return
     
     pub_key = wallet[2]
+    msg = await message.answer("Checking balance...")
+    
     try:
         sol_bal = await jup.get_sol_balance(config.RPC_URL, pub_key)
-        await message.answer(f"💰 **Balance:** {sol_bal/1e9:.4f} SOL")
+        sol_fmt = sol_bal / 1_000_000_000
+        
+        text = (
+            "Wallet Status\n"
+            "──────────────────\n"
+            f"Address: {pub_key[:4]}...{pub_key[-4:]}\n"
+            f"Balance: {sol_fmt:.4f} SOL"
+        )
+        await msg.edit_text(text)
     except Exception as e:
-        await message.answer(f"⚠️ Balance Error: {e}")
+        await msg.edit_text(f"Error checking balance: {e}")
 
-# --- CATCH-ALL HANDLER (The Fix for "Not Responding") ---
+# --- CATCH ALL ---
 @dp.message()
-async def catch_all(message: types.Message):
-    """
-    This catches ANY message that didn't match the rules above.
-    """
-    await message.answer(
-        "❓ I didn't understand that.\n"
-        "Please select an option from the menu or paste a valid Contract Address.",
-        reply_markup=get_main_menu()
-    )
+async def unknown_command(message: types.Message):
+    # Only reply if it's a private chat to avoid group spam
+    if message.chat.type == "private":
+        await message.answer(
+            "I didn't understand that command.\n"
+            "Please use the menu buttons below.",
+            reply_markup=get_main_menu()
+        )
 
-# --- MAIN ENTRY ---
+# --- MAIN ---
 async def main():
     await start_web_server()
     await db.init_db()
-    # Force drop old updates to stop the bot from processing stale messages
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
