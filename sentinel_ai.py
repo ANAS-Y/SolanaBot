@@ -1,20 +1,16 @@
-import google.generativeai as genai
-import config
+import httpx
 import logging
+import json
+import config
 
-# Configure Gemini
-if config.GEMINI_API_KEY:
-    genai.configure(api_key=config.GEMINI_API_KEY)
-    # UPDATED MODEL NAME: gemini-1.5-flash is the current standard for fast/free tier
-    model = genai.GenerativeModel('gemini-1.5-flash')
-else:
-    model = None
+# We use the direct REST API endpoint for Gemini 1.5 Flash (Fast & Free)
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={}"
 
 async def analyze_token(ca, safety_status, market_data):
     """
-    Sends data to Gemini AI for a trading decision.
+    Sends data to Gemini AI via Direct REST API (Bypassing the broken SDK).
     """
-    if not model:
+    if not config.GEMINI_API_KEY:
         return "WAIT", "⚠️ Gemini API Key missing."
 
     # 1. HARD RULES (Pre-Filter)
@@ -24,42 +20,58 @@ async def analyze_token(ca, safety_status, market_data):
     if market_data['liquidity'] < 5000:
         return "AVOID", "💧 Liquidity too low (<$5k)."
 
-    # 2. AI PROMPT CONSTRUCTION
-    prompt = f"""
-    You are Sentinel AI, a conservative cryptocurrency scalper specialized in Solana.
-    
-    TOKEN DATA:
+    # 2. PREPARE DATA
+    prompt_text = f"""
+    You are Sentinel AI, a crypto scalper.
+    Analyze this Solana token:
     - Contract: {ca}
-    - Safety Verdict: {safety_status}
+    - Safety: {safety_status}
     - Liquidity: ${market_data['liquidity']:,.2f}
     - Volume (5m): ${market_data['volume_5m']:,.2f}
-    - Volume (1h): ${market_data['volume_1h']:,.2f}
-    - Buys (5m): {market_data['txns_5m_buys']}
-    - Sells (5m): {market_data['txns_5m_sells']}
-    - Market Cap (FDV): ${market_data['fdv']:,.2f}
+    - Buys/Sells (5m): {market_data['txns_5m_buys']}/{market_data['txns_5m_sells']}
+    - FDV: ${market_data['fdv']:,.2f}
 
-    DECISION RULES:
-    1. If Safety is UNSAFE, decision MUST be 'AVOID'.
-    2. If Volume (5m) is under $500, return 'WAIT' (Not enough activity).
-    3. If Sells > Buys by 2x, return 'WAIT' (Selling pressure).
-    4. If Buys > Sells AND Volume is high AND Price is trending up, return 'BUY'.
+    RULES:
+    - UNSAFE Safety -> AVOID.
+    - Vol (5m) < $500 -> WAIT.
+    - Sells > Buys (2x) -> WAIT.
+    - High Vol + More Buys -> BUY.
 
-    TASK:
-    Analyze the data. Return a JSON string with exactly two fields:
-    1. "decision": One of ["BUY", "WAIT", "AVOID"]
-    2. "reason": A short explanation (max 1 sentence).
+    OUTPUT FORMAT:
+    Return a single sentence starting with BUY, WAIT, or AVOID, followed by the reason.
+    Example: "BUY because volume is high and momentum is positive."
     """
 
+    payload = {
+        "contents": [{
+            "parts": [{"text": prompt_text}]
+        }]
+    }
+
+    # 3. SEND DIRECT REQUEST
     try:
-        # Run in executor to avoid blocking async loop
-        response = await model.generate_content_async(prompt)
-        text = response.text.strip()
-        
-        # Simple parsing
-        if "BUY" in text: return "BUY", text
-        if "AVOID" in text: return "AVOID", text
-        return "WAIT", text
+        url = GEMINI_URL.format(config.GEMINI_API_KEY)
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(url, json=payload, timeout=10)
+            
+            if resp.status_code != 200:
+                logging.error(f"Gemini API Error {resp.status_code}: {resp.text}")
+                return "WAIT", f"Google API Error: {resp.status_code}"
+
+            data = resp.json()
+            # Extract text from complex JSON response
+            try:
+                text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            except (KeyError, IndexError):
+                return "WAIT", "AI returned empty response."
+
+            # Parse Decision
+            if text.startswith("BUY"): return "BUY", text[3:].strip("- :")
+            if text.startswith("AVOID"): return "AVOID", text[5:].strip("- :")
+            if text.startswith("WAIT"): return "WAIT", text[4:].strip("- :")
+            
+            return "WAIT", text
 
     except Exception as e:
-        logging.error(f"Gemini Error: {e}")
-        return "WAIT", f"AI Error: {str(e)}"
+        logging.error(f"Gemini Connection Error: {e}")
+        return "WAIT", "AI Unreachable"
