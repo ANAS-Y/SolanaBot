@@ -27,7 +27,7 @@ if not config.BOT_TOKEN:
 bot = Bot(token=config.BOT_TOKEN)
 dp = Dispatcher()
 
-# --- WEB SERVER (Render Requirement) ---
+# --- WEB SERVER ---
 async def health_check(request):
     return web.Response(text="Sentinel AI is running", status=200)
 
@@ -46,15 +46,12 @@ async def start_web_server():
 class BotStates(StatesGroup):
     waiting_for_token = State()
 
-# --- MENUS (Beautiful UI) ---
-
+# --- MENUS ---
 def get_launch_menu():
-    """The initial Start Button"""
     kb = [[KeyboardButton(text="🚀 Launch App")]]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 def get_main_menu():
-    """The Main Dashboard - Clean Labels"""
     kb = [
         [KeyboardButton(text="🧠 AI Analysis"), KeyboardButton(text="🛡️ Safety Check")],
         [KeyboardButton(text="💰 My Wallet"), KeyboardButton(text="📊 Active Trades")]
@@ -62,164 +59,110 @@ def get_main_menu():
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 def get_cancel_menu():
-    """Universal Cancel Button"""
     kb = [[KeyboardButton(text="❌ Cancel Operation")]]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
-# --- HELPER: SAFE EDIT ---
+# --- HELPER: SAFE EDIT (FIXED) ---
 async def safe_edit(message: types.Message, text: str):
     """
-    Safely edits a message. If the text is the same (Telegram Error),
-    it ignores the error and continues.
+    Prevents 'Message Not Modified' errors by checking content first.
     """
+    if message.text == text:
+        return # Skip if text is identical
     try:
         await message.edit_text(text)
     except Exception as e:
-        # Ignore "message is not modified" errors
-        if "message is not modified" not in str(e):
-            logging.warning(f"Edit Error: {e}")
+        logging.warning(f"UI Update Skipped: {e}")
 
 # --- START FLOW ---
-
 @dp.message(Command("start"))
 async def start(message: types.Message, state: FSMContext):
     await state.clear()
     await db.init_db()
-    
-    welcome_text = (
+    welcome = (
         "Sentinel AI\n"
         "──────────────────\n"
         "Your autonomous crypto trading agent.\n"
-        "Powered by Google Gemini & RugCheck.\n\n"
-        "Tap the button below to begin."
+        "Tap below to begin."
     )
-    await message.answer(welcome_text, reply_markup=get_launch_menu())
+    await message.answer(welcome, reply_markup=get_launch_menu())
 
 @dp.message(F.text == "🚀 Launch App")
 async def launch_app(message: types.Message, state: FSMContext):
     await state.clear()
-    text = (
-        "Main Menu\n"
-        "──────────────────\n"
-        "Select a tool to proceed:"
-    )
-    await message.answer(text, reply_markup=get_main_menu())
+    await message.answer("Main Menu\n──────────────────", reply_markup=get_main_menu())
 
-# --- CANCEL HANDLER (Universal) ---
 @dp.message(F.text == "❌ Cancel Operation")
 async def cancel_op(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("Operation cancelled.", reply_markup=get_main_menu())
 
 # --- FEATURE: AI ANALYSIS ---
-
 @dp.message(F.text == "🧠 AI Analysis")
 async def analyze_start(message: types.Message, state: FSMContext):
-    text = (
-        "New Analysis\n"
-        "──────────────────\n"
-        "Paste the Token Contract Address below.\n\n"
-        "Hint: It is a long string of random letters."
+    await message.answer(
+        "New Analysis\n──────────────────\nPaste Token Address:", 
+        reply_markup=get_cancel_menu()
     )
-    await message.answer(text, reply_markup=get_cancel_menu())
     await state.set_state(BotStates.waiting_for_token)
 
 @dp.message(BotStates.waiting_for_token)
 async def analyze_process(message: types.Message, state: FSMContext):
     ca = message.text.strip()
-    
-    # Basic Validation
     if len(ca) < 30 or " " in ca:
-        await message.answer("Invalid address format. Please try again.", reply_markup=get_cancel_menu())
+        await message.answer("Invalid address.", reply_markup=get_cancel_menu())
         return
 
-    # Status Message
-    status = await message.answer("🔎 Scanning network...", reply_markup=get_cancel_menu())
+    status = await message.answer("🔎 Scanning...", reply_markup=get_cancel_menu())
 
-    # 1. Safety Check
-    await safe_edit(status, "🛡️ Checking RugCheck safety database...")
+    # 1. Safety
+    await safe_edit(status, "🛡️ Checking Safety...")
     safety_verdict, safety_reason = await data_engine.get_rugcheck_report(ca)
     
     if safety_verdict == "UNSAFE":
-        await safe_edit(status,
-            f"⛔ BLOCKED: Unsafe Token\n"
-            f"──────────────────\n"
-            f"Reason: {safety_reason}\n\n"
-            f"Analysis stopped to protect funds."
-        )
+        await safe_edit(status, f"⛔ BLOCKED: Unsafe\nReason: {safety_reason}")
         await state.clear()
-        await message.answer("Select an option:", reply_markup=get_main_menu())
+        await message.answer("Menu:", reply_markup=get_main_menu())
         return
 
     # 2. Market Data
-    await safe_edit(status, "📊 Fetching live market data...")
+    await safe_edit(status, "📊 Fetching Data...")
     market_data = await data_engine.get_market_data(ca)
     if not market_data:
-        await safe_edit(status, "❌ Error: Could not fetch market data. The token might be too new.")
+        await safe_edit(status, "❌ Market Data Unavailable")
         await state.clear()
-        await message.answer("Select an option:", reply_markup=get_main_menu())
         return
 
     # 3. AI Analysis
-    await safe_edit(status, "🧠 Gemini AI is analyzing price action...")
+    await safe_edit(status, "🧠 AI Analyzing...")
     decision, reason = await sentinel_ai.analyze_token(ca, safety_verdict, market_data)
 
-    # 4. Final Output (Clean Formatting)
+    # 4. Result
     emoji = "🟢" if decision == "BUY" else "🟡" if decision == "WAIT" else "🔴"
-    
-    result_text = (
+    result = (
         f"{emoji} Verdict: {decision}\n"
         f"──────────────────\n"
-        f"Safety: {safety_reason}\n"
         f"Liquidity: ${market_data['liquidity']:,.0f}\n"
-        f"Volume (5m): ${market_data['volume_5m']:,.0f}\n\n"
-        f"AI Reasoning:\n"
-        f"{reason}"
+        f"AI: {reason}"
     )
-    
-    await safe_edit(status, result_text)
-    await message.answer("Select an option:", reply_markup=get_main_menu())
+    await safe_edit(status, result)
+    await message.answer("Menu:", reply_markup=get_main_menu())
     await state.clear()
 
-# --- FEATURE: WALLET ---
-
+# --- WALLET ---
 @dp.message(F.text == "💰 My Wallet")
 async def check_wallet(message: types.Message):
     wallet = await db.get_wallet(message.from_user.id)
     if not wallet:
-        await message.answer(
-            "No wallet connected.\n"
-            "Go to ⚙️ Settings to create or import one.",
-            reply_markup=get_main_menu()
-        )
+        await message.answer("No wallet found. Go to Settings.", reply_markup=get_main_menu())
         return
     
-    pub_key = wallet[2]
-    msg = await message.answer("Checking balance...")
-    
+    msg = await message.answer("Checking...")
     try:
-        sol_bal = await jup.get_sol_balance(config.RPC_URL, pub_key)
-        sol_fmt = sol_bal / 1_000_000_000
-        
-        text = (
-            "Wallet Status\n"
-            "──────────────────\n"
-            f"Address: {pub_key[:4]}...{pub_key[-4:]}\n"
-            f"Balance: {sol_fmt:.4f} SOL"
-        )
-        await safe_edit(msg, text)
-    except Exception as e:
-        await safe_edit(msg, f"Error checking balance: {e}")
-
-# --- CATCH ALL ---
-@dp.message()
-async def unknown_command(message: types.Message):
-    if message.chat.type == "private":
-        await message.answer(
-            "I didn't understand that command.\n"
-            "Please use the menu buttons below.",
-            reply_markup=get_main_menu()
-        )
+        bal = await jup.get_sol_balance(config.RPC_URL, wallet[2])
+        await safe_edit(msg, f"Wallet\n──────────────────\nBalance: {bal/1e9:.4f} SOL")
+    except:
+        await safe_edit(msg, "Error checking balance.")
 
 # --- MAIN ---
 async def main():
