@@ -1,8 +1,9 @@
 aiogram>=3.4.1
+google-generativeai
 solana==0.32.0
 solders==0.20.0
 aiohttp
-aiodns
+httpx
 asyncpg
 cryptography
 base58
