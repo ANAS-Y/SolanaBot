@@ -5,16 +5,15 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- SECRETS & KEYS ---
-BOT_TOKEN = os.getenv("8529158400:AAGXihFeJ7imqju-c2Q_cYxiRmu0PP_GYsI")
-GEMINI_API_KEY = os.getenv("AIzaSyBIjr13PFLDJWHO3dsmJtQLXbGu9zr60_I") # Get this from aistudio.google.com
-DATABASE_URL = os.getenv("postgresql://neondb_owner:npg_Qoz2bkRrUL7j@ep-fancy-brook-ahsds3be-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require")
-
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 # --- VALIDATION ---
 missing = []
-if not BOT_TOKEN: missing.append("8529158400:AAGXihFeJ7imqju-c2Q_cYxiRmu0PP_GYsI")
-if not GEMINI_API_KEY: missing.append("AIzaSyBIjr13PFLDJWHO3dsmJtQLXbGu9zr60_I")
-if not DATABASE_URL: missing.append("postgresql://neondb_owner:npg_Qoz2bkRrUL7j@ep-fancy-brook-ahsds3be-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require")
+if not BOT_TOKEN: missing.append("BOT_TOKEN")
+if not GEMINI_API_KEY: missing.append("GEMINI_API_KEY")
+if not DATABASE_URL: missing.append("DATABASE_URL")
 
 if missing:
     print("------------------------------------------------------")
