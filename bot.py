@@ -62,17 +62,24 @@ def get_cancel_menu():
     kb = [[KeyboardButton(text="❌ Cancel Operation")]]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
-# --- HELPER: SAFE EDIT (FIXED) ---
+# --- HELPER: SAFE EDIT (MARKDOWN FIX) ---
 async def safe_edit(message: types.Message, text: str):
     """
-    Prevents 'Message Not Modified' errors by checking content first.
+    Safely edits a message. Handles 'Not Modified' and Markdown errors.
     """
-    if message.text == text:
-        return # Skip if text is identical
+    if message.text == text: return 
     try:
-        await message.edit_text(text)
+        # Try editing with Markdown first
+        await message.edit_text(text, parse_mode="Markdown")
     except Exception as e:
-        logging.warning(f"UI Update Skipped: {e}")
+        if "message is not modified" in str(e): return
+        
+        # If Markdown fails, strip special chars and try plain text
+        try:
+            logging.warning(f"Markdown failed, retrying plain text: {e}")
+            await message.edit_text(text, parse_mode=None)
+        except Exception as e2:
+            logging.error(f"UI Update Failed completely: {e2}")
 
 # --- START FLOW ---
 @dp.message(Command("start"))
