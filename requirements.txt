@@ -5,6 +5,7 @@ solders==0.20.0
 aiohttp
 httpx
 asyncpg
+aiosqlite
 cryptography
 base58
 python-dotenv
