@@ -12,7 +12,9 @@ GENERATE_BASE = "https://generativelanguage.googleapis.com/v1beta/{}:generateCon
 CACHED_MODEL_NAME = None
 
 async def get_best_model():
-    """Finds best model, prioritizing Flash for speed."""
+    """
+    Finds the best model, prioritizing High-Rate-Limit models (Flash).
+    """
     global CACHED_MODEL_NAME
     if CACHED_MODEL_NAME: return CACHED_MODEL_NAME
 
@@ -28,33 +30,42 @@ async def get_best_model():
                     if "generateContent" in m.get("supportedGenerationMethods", []):
                         candidates.append(m['name'])
                 
-                # Priority 1: 1.5 Flash (Stable)
+                # PRIORITY 1: Gemini 1.5 Flash (Fastest, Best Rate Limits)
                 for name in candidates:
                     if "gemini-1.5-flash" in name and "exp" not in name:
-                        logging.info(f"🧠 Selected Model: {name}")
+                        logging.info(f"🧠 Selected High-Speed Model: {name}")
                         CACHED_MODEL_NAME = name
                         return name
                 
-                # Priority 2: Pro
+                # PRIORITY 2: Gemini 1.5 Pro
                 for name in candidates:
                     if "gemini-1.5-pro" in name:
                         CACHED_MODEL_NAME = name
                         return name
 
-                if candidates: return candidates[0]
+                # Fallback
+                if candidates:
+                    CACHED_MODEL_NAME = candidates[0]
+                    return candidates[0]
 
     except Exception as e:
         logging.error(f"Model Discovery Failed: {e}")
     
+    # Absolute Fallback (This usually works on standard keys)
     return "models/gemini-1.5-flash"
 
 async def analyze_token(ca, safety_status, market_data):
-    if not config.GEMINI_API_KEY: return "WAIT", "⚠️ Gemini Key Missing"
+    """
+    Analyzes token with Automatic Retries for 429 Errors.
+    """
+    if not config.GEMINI_API_KEY:
+        return "WAIT", "⚠️ Gemini API Key missing."
 
-    # Pre-Filter
-    if safety_status == "UNSAFE": return "AVOID", "⛔ RugCheck Failed"
-    if market_data['liquidity'] < 5000: return "AVOID", "💧 Liquidity Low"
+    # 1. HARD RULES
+    if safety_status == "UNSAFE": return "AVOID", "⛔ RugCheck failed."
+    if market_data['liquidity'] < 5000: return "AVOID", "💧 Liquidity too low (<$5k)."
 
+    # 2. PREPARE DATA
     prompt_text = f"""
     Act as a crypto scalper. Analyze this Solana token:
     - Contract: {ca}
@@ -74,37 +85,44 @@ async def analyze_token(ca, safety_status, market_data):
     """
 
     payload = {"contents": [{"parts": [{"text": prompt_text}]}]}
+
+    # 3. SEND REQUEST WITH RETRY LOGIC (The Fix)
     model_name = await get_best_model()
     url = GENERATE_BASE.format(model_name, config.GEMINI_API_KEY)
 
     async with httpx.AsyncClient() as client:
-        # Retry Logic (3 Attempts)
-        for attempt in range(1, 4):
+        # Try up to 3 times
+        for attempt in range(1, 4): 
             try:
                 resp = await client.post(url, json=payload, timeout=30.0)
                 
+                # SUCCESS
                 if resp.status_code == 200:
                     data = resp.json()
                     try:
                         text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                        # Parse
                         upper = text.upper()
                         if upper.startswith("BUY"): return "BUY", text[3:].strip("- :")
                         if upper.startswith("AVOID"): return "AVOID", text[5:].strip("- :")
                         return "WAIT", text[:100]
-                    except: return "WAIT", "Parsing Error"
+                    except:
+                        return "WAIT", "AI Parsing Error"
 
+                # HANDLING 429 (RATE LIMIT)
                 elif resp.status_code == 429:
-                    wait = 2 ** attempt
-                    await asyncio.sleep(wait)
-                    continue
+                    wait_time = 2 ** attempt # 2s, 4s, 8s
+                    logging.warning(f"⚠️ AI Rate Limit (429). Retrying in {wait_time}s...")
+                    await asyncio.sleep(wait_time)
+                    continue # Try again
                 
-                elif resp.status_code == 403:
-                    return "WAIT", "⚠️ API Key Blocked/Leaked."
-                
+                # OTHER ERRORS
                 else:
+                    logging.error(f"Gemini API Error {resp.status_code}: {resp.text}")
                     return "WAIT", f"AI Error: {resp.status_code}"
 
-            except Exception:
+            except Exception as e:
+                logging.error(f"Connection Error: {e}")
                 await asyncio.sleep(1)
 
-    return "WAIT", "⚠️ AI Busy"
+    return "WAIT", "⚠️ AI Busy (Rate Limited)"
