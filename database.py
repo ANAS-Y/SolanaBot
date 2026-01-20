@@ -1,91 +1,82 @@
-import os
-import asyncpg
+import aiosqlite
 import logging
 
-DB_URL = os.getenv("DATABASE_URL")
+DB_NAME = "sentinel.db"
 
 async def init_db():
-    if not DB_URL:
-        logging.error("❌ DATABASE_URL is missing!")
-        return
-
-    try:
-        conn = await asyncpg.connect(DB_URL)
-        await conn.execute('''
+    async with aiosqlite.connect(DB_NAME) as db:
+        # User Wallet Table
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS wallets (
-                user_id BIGINT PRIMARY KEY,
-                public_key TEXT,
-                encrypted_priv_key BYTEA,
-                salt BYTEA
+                user_id INTEGER PRIMARY KEY,
+                private_key TEXT,
+                public_key TEXT
             )
-        ''')
-        await conn.execute('''
-            CREATE TABLE IF NOT EXISTS active_trades (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT,
-                token_mint TEXT,
-                amount_tokens REAL,
-                entry_price_usd REAL,
-                stop_loss_pct REAL,
-                take_profit_pct REAL
+        """)
+        
+        # Active Trades Table (For the Auto-Sell Monitor)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                token_address TEXT,
+                amount_sol REAL,
+                entry_price REAL,
+                token_amount REAL,
+                status TEXT DEFAULT 'OPEN', -- OPEN, CLOSED
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
-        ''')
-        await conn.close()
-        logging.info("✅ Database ready.")
-    except Exception as e:
-        logging.error(f"❌ DB Init Error: {e}")
+        """)
+        
+        # User Settings
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                user_id INTEGER PRIMARY KEY,
+                slippage REAL DEFAULT 1.0,
+                auto_buy BOOLEAN DEFAULT 0
+            )
+        """)
+        await db.commit()
 
-async def add_wallet(user_id, pub_key, enc_key, salt):
-    conn = await asyncpg.connect(DB_URL)
-    try:
-        await conn.execute('''
-            INSERT INTO wallets (user_id, public_key, encrypted_priv_key, salt)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (user_id) DO UPDATE 
-            SET public_key = $2, encrypted_priv_key = $3, salt = $4
-        ''', user_id, pub_key, enc_key, salt)
-    finally:
-        await conn.close()
-
+# --- WALLET OPS ---
 async def get_wallet(user_id):
-    conn = await asyncpg.connect(DB_URL)
-    try:
-        row = await conn.fetchrow('SELECT encrypted_priv_key, salt, public_key FROM wallets WHERE user_id = $1', user_id)
-        if row:
-            return (row['encrypted_priv_key'], row['salt'], row['public_key'])
-        return None
-    finally:
-        await conn.close()
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT * FROM wallets WHERE user_id = ?", (user_id,)) as cursor:
+            return await cursor.fetchone()
 
-# --- NEW FUNCTION TO FIX "ALREADY EXISTS" BUG ---
-async def delete_wallet(user_id):
-    conn = await asyncpg.connect(DB_URL)
-    try:
-        await conn.execute('DELETE FROM wallets WHERE user_id = $1', user_id)
-    finally:
-        await conn.close()
+async def add_wallet(user_id, priv, pub):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("INSERT OR REPLACE INTO wallets (user_id, private_key, public_key) VALUES (?, ?, ?)", 
+                         (user_id, priv, pub))
+        await db.commit()
 
-async def add_trade(user_id, mint, amount, entry, sl, tp):
-    conn = await asyncpg.connect(DB_URL)
-    try:
-        await conn.execute('''
-            INSERT INTO active_trades (user_id, token_mint, amount_tokens, entry_price_usd, stop_loss_pct, take_profit_pct) 
-            VALUES ($1, $2, $3, $4, $5, $6)
-        ''', user_id, mint, amount, entry, sl, tp)
-    finally:
-        await conn.close()
+# --- TRADE OPS ---
+async def add_trade(user_id, ca, sol_amt, entry_price, token_amt):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("""
+            INSERT INTO trades (user_id, token_address, amount_sol, entry_price, token_amount)
+            VALUES (?, ?, ?, ?, ?)
+        """, (user_id, ca, sol_amt, entry_price, token_amt))
+        await db.commit()
 
 async def get_active_trades():
-    conn = await asyncpg.connect(DB_URL)
-    try:
-        rows = await conn.fetch('SELECT * FROM active_trades')
-        return [(r['id'], r['user_id'], r['token_mint'], r['amount_tokens'], r['entry_price_usd'], r['stop_loss_pct'], r['take_profit_pct']) for r in rows]
-    finally:
-        await conn.close()
+    """Fetches all OPEN trades for the background monitor"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM trades WHERE status = 'OPEN'") as cursor:
+            return await cursor.fetchall()
 
-async def delete_trade(trade_id):
-    conn = await asyncpg.connect(DB_URL)
-    try:
-        await conn.execute('DELETE FROM active_trades WHERE id = $1', trade_id)
-    finally:
-        await conn.close()
+async def close_trade(trade_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE trades SET status = 'CLOSED' WHERE id = ?", (trade_id,))
+        await db.commit()
+
+# --- SETTINGS OPS ---
+async def get_settings(user_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT * FROM settings WHERE user_id = ?", (user_id,)) as cursor:
+            res = await cursor.fetchone()
+            if not res:
+                # Default settings
+                return (user_id, 1.0, 0) # 1% slippage, Auto-Buy OFF
+            return res
