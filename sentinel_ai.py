@@ -92,7 +92,7 @@ async def analyze_token(ca, safety_status, market_data):
 
     async with httpx.AsyncClient() as client:
         # Try up to 3 times
-        for attempt in range(1, 4):
+        for attempt in range(1, 4): 
             try:
                 resp = await client.post(url, json=payload, timeout=30.0)
                 
