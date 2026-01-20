@@ -15,7 +15,7 @@ async def init_db():
             )
         """)
         
-        # Active Trades
+        # Active Trades Table
         await db.execute("""
             CREATE TABLE IF NOT EXISTS trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -29,7 +29,7 @@ async def init_db():
             )
         """)
         
-        # Settings Table (Full Configuration)
+        # Settings Table
         await db.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 user_id INTEGER PRIMARY KEY,
@@ -42,10 +42,21 @@ async def init_db():
             )
         """)
         
-        # Migration Helpers (Safely ignore errors if cols exist)
-        try: await db.execute("ALTER TABLE settings ADD COLUMN take_profit REAL DEFAULT 30.0"); except: pass
-        try: await db.execute("ALTER TABLE settings ADD COLUMN stop_loss REAL DEFAULT 15.0"); except: pass
-        try: await db.execute("ALTER TABLE settings ADD COLUMN auto_sell BOOLEAN DEFAULT 1"); except: pass
+        # Migration Helpers (Corrected Multi-line Format)
+        try: 
+            await db.execute("ALTER TABLE settings ADD COLUMN take_profit REAL DEFAULT 30.0")
+        except Exception: 
+            pass
+
+        try: 
+            await db.execute("ALTER TABLE settings ADD COLUMN stop_loss REAL DEFAULT 15.0")
+        except Exception: 
+            pass
+
+        try: 
+            await db.execute("ALTER TABLE settings ADD COLUMN auto_sell BOOLEAN DEFAULT 1")
+        except Exception: 
+            pass
 
         await db.commit()
 
@@ -83,7 +94,7 @@ async def get_wallet(user_id):
                     decrypted_pk = key_manager.decrypt_key(row[1])
                     return (row[0], decrypted_pk, row[2])
                 except Exception:
-                    return None # Key Error
+                    return None
             return None
 
 async def add_wallet(user_id, priv, pub):
