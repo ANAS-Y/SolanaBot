@@ -4,7 +4,7 @@ import os
 import sys
 import config 
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
@@ -47,7 +47,6 @@ class BotStates(StatesGroup):
 
 # --- MENUS ---
 def get_main_menu():
-    """Persistent Main Menu"""
     kb = [
         [KeyboardButton(text="🧠 Analyze Token"), KeyboardButton(text="💰 Wallet")],
         [KeyboardButton(text="📊 Active Trades"), KeyboardButton(text="⚙️ Settings")],
@@ -56,11 +55,9 @@ def get_main_menu():
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 def get_cancel_kb():
-    """Cancel button for text inputs"""
     return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Cancel")]], resize_keyboard=True)
 
 def get_trade_panel(ca, price):
-    """Buy buttons (Only shown if token is SAFE)"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="Buy 0.1 SOL", callback_data=f"buy_0.1_{ca}_{price}"),
@@ -71,37 +68,125 @@ def get_trade_panel(ca, price):
     ])
 
 def get_risk_panel():
-    """Panel for risky tokens (No Buy options)"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⚠️ High Risk - Trading Blocked", callback_data="blocked")],
         [InlineKeyboardButton(text="🔙 Main Menu", callback_data="close_panel")]
     ])
 
-# --- 1. START & NAVIGATION ---
-@dp.message(Command("start"))
+# --- MONITOR ---
+async def position_monitor():
+    while True:
+        try:
+            trades = await db.get_active_trades()
+            for trade in trades:
+                settings = await db.get_settings(trade['user_id'])
+                tp_target = settings['take_profit']
+                sl_target = settings['stop_loss'] * -1
+                auto_sell = settings['auto_sell']
+
+                market = await data_engine.get_market_data(trade['token_address'])
+                if not market: continue
+                
+                curr_price = market['priceUsd']
+                entry = trade['entry_price']
+                pnl = ((curr_price - entry) / entry) * 100
+
+                triggered = False
+                msg_type = ""
+                
+                if pnl >= tp_target:
+                    triggered = True
+                    msg_type = "🚀 **Take Profit Hit!**"
+                elif pnl <= sl_target:
+                    triggered = True
+                    msg_type = "🛑 **Stop Loss Hit!**"
+
+                if triggered:
+                    if auto_sell:
+                        await bot.send_message(trade['user_id'], f"{msg_type}\nToken: `{trade['token_address'][:6]}...`\nPnL: {pnl:.2f}%\n✅ **Auto-Selling...**")
+                        await db.close_trade(trade['id'])
+                    else:
+                        pass 
+
+        except Exception as e:
+            logging.error(f"Monitor Error: {e}")
+        
+        await asyncio.sleep(15)
+
+# --- SETTINGS PANEL ---
+async def show_settings_panel(user_id, message_obj=None, edit_mode=False):
+    s = await db.get_settings(user_id)
+    slippage = s['slippage']
+    auto_buy = "✅ ON" if s['auto_buy'] else "🔴 OFF"
+    auto_sell = "✅ ON" if s['auto_sell'] else "🔴 OFF"
+    sim_mode = "🧪 SIMULATION" if s['simulation_mode'] else "💸 REAL MONEY"
+    tp = s['take_profit']
+    sl = s['stop_loss']
+
+    text = "⚙️ **Bot Configuration**\n──────────────────"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"💧 Slippage: {slippage}%", callback_data="set_slippage")],
+        [InlineKeyboardButton(text=f"🚀 TP: +{tp}%", callback_data="set_tp"), InlineKeyboardButton(text=f"🛑 SL: -{sl}%", callback_data="set_sl")],
+        [InlineKeyboardButton(text=f"🤖 Auto-Buy: {auto_buy}", callback_data="toggle_autobuy"), InlineKeyboardButton(text=f"📉 Auto-Sell: {auto_sell}", callback_data="toggle_autosell")],
+        [InlineKeyboardButton(text=f"Mode: {sim_mode}", callback_data="toggle_sim")],
+        [InlineKeyboardButton(text="❌ Close", callback_data="close_panel")]
+    ])
+
+    if edit_mode and message_obj: await message_obj.edit_text(text, reply_markup=kb)
+    elif message_obj: await message_obj.answer(text, reply_markup=kb)
+
+# --- GLOBAL NAVIGATION (StateFilter("*")) ---
+# These handlers now work ANY time, even if stuck in another menu.
+
+@dp.message(Command("start"), StateFilter("*"))
 async def start(message: types.Message, state: FSMContext):
     await state.clear()
     await db.init_db()
-    await message.answer(
-        "👁️ **Sentinel AI Online**\n"
-        "Advanced Solana Trading Agent.\n"
-        "Select an option below to begin.",
-        reply_markup=get_main_menu()
-    )
+    await message.answer("👁️ **Sentinel AI Online**\nReady.", reply_markup=get_main_menu())
 
-@dp.message(F.text == "❌ Cancel")
+@dp.message(F.text == "❌ Cancel", StateFilter("*"))
 async def cancel_op(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("✅ Operation Cancelled.", reply_markup=get_main_menu())
+    await message.answer("✅ Cancelled.", reply_markup=get_main_menu())
 
-@dp.callback_query(F.data == "close_panel")
-async def close_panel(callback: types.CallbackQuery):
-    await callback.message.delete()
+@dp.message(F.text == "⚙️ Settings", StateFilter("*"))
+async def settings_menu(message: types.Message, state: FSMContext):
+    await state.clear()
+    await show_settings_panel(message.from_user.id, message)
 
-# --- 2. SECURITY-AWARE ANALYSIS ---
-@dp.message(F.text == "🧠 Analyze Token")
+@dp.message(F.text == "💰 Wallet", StateFilter("*"))
+async def wallet_menu(message: types.Message, state: FSMContext):
+    await state.clear()
+    wallet = await db.get_wallet(message.from_user.id)
+    if not wallet:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🆕 Create", callback_data="wallet_create"), InlineKeyboardButton(text="📥 Import", callback_data="wallet_import")]])
+        return await message.answer("❌ No Wallet Found.", reply_markup=kb)
+    
+    bal = await jup.get_sol_balance(config.RPC_URL, wallet[2])
+    text = f"💰 **Wallet**\n`{wallet[2]}`\nBalance: **{bal/1e9:.4f} SOL**"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💸 Withdraw", callback_data="withdraw_start")],
+        [InlineKeyboardButton(text="🔑 Export Key", callback_data="export_key")]
+    ])
+    await message.answer(text, reply_markup=kb)
+
+@dp.message(F.text == "📊 Active Trades", StateFilter("*"))
+async def show_trades(message: types.Message, state: FSMContext):
+    await state.clear()
+    trades = await db.get_active_trades()
+    user_trades = [t for t in trades if t['user_id'] == message.from_user.id]
+    if not user_trades: return await message.answer("💤 No active trades.")
+    
+    txt = "📊 **Positions:**\n\n"
+    for t in user_trades: txt += f"• `{t['token_address'][:4]}...` | Entry: ${t['entry_price']}\n"
+    await message.answer(txt)
+
+# --- ANALYZE FLOW ---
+@dp.message(F.text == "🧠 Analyze Token", StateFilter("*"))
 async def analyze_start(message: types.Message, state: FSMContext):
-    await message.answer("📝 **Paste Contract Address (CA):**", reply_markup=get_main_menu())
+    await state.clear()
+    await message.answer("📝 **Paste Contract Address (CA):**", reply_markup=get_cancel_kb())
     await state.set_state(BotStates.waiting_for_token)
 
 @dp.message(BotStates.waiting_for_token)
@@ -109,93 +194,116 @@ async def analyze_process(message: types.Message, state: FSMContext):
     ca = message.text.strip()
     if len(ca) < 30: return await message.answer("❌ Invalid Address.")
 
-    status = await message.answer("🔎 **Scanning Token & Security...**")
-
-    # 1. Fetch Security & Market Data
-    # Returns: (verdict, details, score, holders_pct)
-    verdict, security_details, risk_score, holder_pct = await data_engine.get_rugcheck_report(ca)
+    status = await message.answer("🔎 **Scanning...**")
     
+    verdict, details, risk_score, holder_pct = await data_engine.get_rugcheck_report(ca)
     market = await data_engine.get_market_data(ca)
+    
     if not market:
-        await status.edit_text("❌ Market data not found (Token might be too new).")
+        await status.delete()
+        await message.answer("❌ No Market Data.")
         await state.clear()
         return
 
-    # 2. Check Risk Rules
-    is_blocked = False
-    block_reason = ""
+    # Risk Block
+    if verdict == "DANGER" or risk_score > 5000 or holder_pct > 60:
+        await status.delete()
+        await message.answer(f"⛔ **BLOCKED: HIGH RISK**\n{details}", reply_markup=get_risk_panel())
+        await state.clear()
+        return
 
-    if verdict == "DANGER":
-        is_blocked = True
-        block_reason = "RugCheck marked this token as DANGER."
-    elif risk_score > 5000:
-        is_blocked = True
-        block_reason = f"Risk Score too high ({risk_score}/10000)."
-    elif holder_pct > 60: # If Top 10 hold > 60%
-        is_blocked = True
-        block_reason = f"Top 10 Holders own {holder_pct:.1f}% (Concentration Risk)."
-
-    # 3. AI Analysis (Pass Security Data)
-    # We pass the block status so AI knows it's risky
+    # AI
     ai_verdict, ai_reason = await sentinel_ai.analyze_token(ca, verdict, market)
 
-    # 4. Generate Report
-    if is_blocked:
-        final_emoji = "⛔"
-        final_title = "BLOCKED - HIGH RISK"
-        panel = get_risk_panel()
-        footer = f"⚠️ **Trading Disabled:** {block_reason}"
-    else:
-        final_emoji = "🟢" if ai_verdict == "BUY" else "🟡"
-        final_title = f"VERDICT: {ai_verdict}"
-        panel = get_trade_panel(ca, market['priceUsd'])
-        footer = "✅ **Safe to Trade**"
-
-    report = (
-        f"{final_emoji} **{final_title}**\n"
-        f"──────────────────\n"
+    emoji = "🟢" if ai_verdict == "BUY" else "🔴"
+    text = (
+        f"{emoji} **Sentinel Analysis**\n"
+        f"Verdict: **{ai_verdict}**\n"
+        f"────────────────\n"
         f"💎 Price: ${market['priceUsd']:.6f}\n"
-        f"💧 Liquidity: ${market['liquidity']:,.0f}\n"
-        f"🛡️ **Security Check:**\n{security_details}\n"
-        f"──────────────────\n"
-        f"🧠 **AI Insight:** {ai_reason}\n\n"
-        f"{footer}"
+        f"🛡️ Security: {details}\n"
+        f"🧠 **AI:** {ai_reason}"
     )
-
     await status.delete()
-    await message.answer(report, reply_markup=panel)
+    await message.answer(text, reply_markup=get_trade_panel(ca, market['priceUsd']))
     await state.clear()
 
-# --- 3. SETTINGS & WALLET (Standard) ---
-# [Keep your existing Settings and Wallet Handlers from previous bot.py here]
-# ... (I will include the shortened versions below for completeness)
+# --- CALLBACKS (SETTINGS / WALLET) ---
+@dp.callback_query(F.data.startswith("toggle_"))
+async def toggle_setting(callback: types.CallbackQuery):
+    mode = callback.data.split("_")[1]
+    col_map = {"autobuy": "auto_buy", "autosell": "auto_sell", "sim": "simulation_mode"}
+    s = await db.get_settings(callback.from_user.id)
+    await db.update_setting(callback.from_user.id, col_map[mode], 0 if s[col_map[mode]] else 1)
+    await show_settings_panel(callback.from_user.id, callback.message, edit_mode=True)
 
-@dp.message(F.text == "⚙️ Settings")
-async def settings_menu(message: types.Message):
-    # Call your show_settings_panel function
-    pass # (Reuse code from previous step)
+@dp.callback_query(F.data.startswith("set_"))
+async def set_value_start(c: types.CallbackQuery, state: FSMContext):
+    mode = c.data.split("_")[1]
+    prompt_map = {
+        "slippage": ("💧 **Enter Slippage %:**", BotStates.waiting_for_slippage),
+        "tp": ("🚀 **Enter Take Profit %:**", BotStates.waiting_for_tp),
+        "sl": ("🛑 **Enter Stop Loss %:**", BotStates.waiting_for_sl)
+    }
+    msg, st = prompt_map[mode]
+    await c.message.delete()
+    await c.message.answer(msg, reply_markup=get_cancel_kb())
+    await state.set_state(st)
 
-@dp.message(F.text == "💰 Wallet")
-async def wallet_menu(message: types.Message):
-    # Call your wallet logic
-    pass # (Reuse code from previous step)
+@dp.message(BotStates.waiting_for_slippage)
+async def set_slip(m: types.Message, state: FSMContext): await process_setting(m, state, "slippage", 0.1, 50)
+@dp.message(BotStates.waiting_for_tp)
+async def set_tp(m: types.Message, state: FSMContext): await process_setting(m, state, "take_profit", 1, 1000)
+@dp.message(BotStates.waiting_for_sl)
+async def set_sl(m: types.Message, state: FSMContext): await process_setting(m, state, "stop_loss", 1, 99)
 
-# --- 4. CATCH-ALL HANDLER ---
-@dp.message()
-async def unknown_command(message: types.Message):
-    """Handles text that matches no commands"""
-    if message.chat.type == "private":
-        await message.answer(
-            "❓ **Command not recognized.**\n"
-            "Please use the menu buttons below.",
-            reply_markup=get_main_menu()
-        )
+async def process_setting(m, state, col, min_v, max_v):
+    try:
+        val = float(m.text)
+        if min_v <= val <= max_v:
+            await db.update_setting(m.from_user.id, col, val)
+            await m.answer(f"✅ Updated.", reply_markup=get_main_menu())
+            await state.clear()
+            await show_settings_panel(m.from_user.id, m)
+        else: raise ValueError
+    except: await m.answer("❌ Invalid.")
+
+@dp.callback_query(F.data == "wallet_create")
+async def wallet_create(c: types.CallbackQuery):
+    priv, pub = jup.create_new_wallet()
+    await db.add_wallet(c.from_user.id, priv, pub)
+    await c.message.edit_text(f"✅ Created!\nAddress: `{pub}`")
+
+@dp.callback_query(F.data == "wallet_import")
+async def wallet_import(c: types.CallbackQuery, state: FSMContext):
+    await c.message.answer("📥 **Paste Private Key:**", reply_markup=get_cancel_kb())
+    await state.set_state(BotStates.waiting_for_import_key)
+
+@dp.message(BotStates.waiting_for_import_key)
+async def import_process(message: types.Message, state: FSMContext):
+    key = message.text.strip()
+    kp = jup.get_keypair_from_base58(key)
+    if not kp: return await message.answer("❌ Invalid.")
+    await db.add_wallet(message.from_user.id, key, str(kp.pubkey()))
+    try: await message.delete() 
+    except: pass
+    await message.answer("✅ Imported.", reply_markup=get_main_menu())
+    await state.clear()
+
+@dp.callback_query(F.data == "export_key")
+async def export_key(c: types.CallbackQuery):
+    w = await db.get_wallet(c.from_user.id)
+    await c.message.answer(f"🔐 **KEY:**\n`{w[1]}`\n\n🔴 DELETE NOW!")
+    await c.answer()
+
+@dp.callback_query(F.data == "close_panel")
+async def close_panel(c: types.CallbackQuery): await c.message.delete()
 
 # --- MAIN ---
 async def main():
     await start_web_server()
     await db.init_db()
-    # asyncio.create_task(position_monitor()) # Uncomment if using monitor
+    asyncio.create_task(position_monitor())
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
