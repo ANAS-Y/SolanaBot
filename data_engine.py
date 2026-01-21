@@ -1,12 +1,15 @@
 import aiohttp
 import logging
 
-# RugCheck Public API (No key needed for basic read, but rate-limited)
+# RugCheck Public API
 RUGCHECK_API = "https://api.rugcheck.xyz/v1/tokens/{}/report"
+# DexScreener API
 DEX_API = "https://api.dexscreener.com/latest/dex/tokens/{}"
 
 async def get_market_data(ca):
-    """Fetches Price, Liquidity, and Volume from DexScreener"""
+    """
+    Fetches Price, Liquidity, Volume, and Transaction Counts from DexScreener.
+    """
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(DEX_API.format(ca)) as resp:
@@ -16,12 +19,19 @@ async def get_market_data(ca):
                 if not data.get("pairs"): return None
                 pair = data["pairs"][0]
                 
+                # Extract Transaction Counts (The missing piece)
+                txns = pair.get("txns", {})
+                m5_txns = txns.get("m5", {})
+                
                 return {
                     "priceUsd": float(pair.get("priceUsd", 0)),
                     "liquidity": pair.get("liquidity", {}).get("usd", 0),
                     "volume_5m": pair.get("volume", {}).get("m5", 0),
                     "fdv": pair.get("fdv", 0),
-                    "pairAddress": pair.get("pairAddress")
+                    "pairAddress": pair.get("pairAddress"),
+                    # These were missing and causing the KeyError:
+                    "txns_5m_buys": m5_txns.get("buys", 0),
+                    "txns_5m_sells": m5_txns.get("sells", 0)
                 }
     except Exception as e:
         logging.error(f"Market Data Error: {e}")
@@ -40,34 +50,26 @@ async def get_rugcheck_report(ca):
                 
                 data = await resp.json()
                 
-                # Extract Risk Score (0-10000 usually)
                 score = data.get("score", 0)
-                
-                # Extract Risks
                 risks = data.get("risks", [])
-                risk_level = "SAFE"
-                risk_msg = "✅ Token looks clean."
                 
-                # Determine Verdict
-                if score > 2000: # RugCheck arbitrary threshold for "Danger"
-                    risk_level = "DANGER"
-                    risk_msg = "⛔ High Risk Detected!"
-                elif score > 500:
-                    risk_level = "WARNING"
-                    risk_msg = "wm Caution Advised."
+                # Verdict Logic
+                risk_level = "SAFE"
+                if score > 2000: risk_level = "DANGER"
+                elif score > 500: risk_level = "WARNING"
                 
                 # Holder Distribution
                 top_holders = data.get("topHolders", [])
                 total_pct = sum(float(h.get("pct", 0)) for h in top_holders[:10])
                 
-                # Create Report String
+                # Detailed Report
                 details = f"Risk Score: {score}\n"
                 if risks:
                     details += "⚠️ **Risks:**\n"
-                    for r in risks[:3]: # Show top 3 risks
-                        details += f"- {r.get('name')}: {r.get('description')}\n"
+                    for r in risks[:3]:
+                        details += f"- {r.get('name')}\n"
                 
-                details += f"👥 **Top 10 Holders:** {total_pct:.1f}% Supply"
+                details += f"👥 **Top 10 Holders:** {total_pct:.1f}%"
                 
                 return risk_level, details, score, total_pct
 
