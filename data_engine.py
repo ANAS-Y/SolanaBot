@@ -1,67 +1,76 @@
-import httpx
+import aiohttp
 import logging
-import config
 
-async def get_rugcheck_report(ca: str):
-    """
-    Step A: Queries RugCheck.xyz to detect scams/rugs.
-    Returns: 'SAFE' or 'UNSAFE' along with a reason.
-    """
-    url = config.RUGCHECK_API.format(ca)
-    
+# RugCheck Public API (No key needed for basic read, but rate-limited)
+RUGCHECK_API = "https://api.rugcheck.xyz/v1/tokens/{}/report"
+DEX_API = "https://api.dexscreener.com/latest/dex/tokens/{}"
+
+async def get_market_data(ca):
+    """Fetches Price, Liquidity, and Volume from DexScreener"""
     try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(url, timeout=10)
-            
-            if resp.status_code != 200:
-                return "UNSAFE", f"API Error {resp.status_code}"
-
-            data = resp.json()
-            score = data.get("score", 5000) # Default to high risk if missing
-            risks = data.get("risks", [])
-
-            # 1. Critical Rule: Mint Authority
-            # If Mint Authority is still enabled, the dev can print infinite tokens.
-            for risk in risks:
-                if risk.get("name") == "Mint Authority" and risk.get("level") == "danger":
-                    return "UNSAFE", "❌ Danger: Mint Authority is Enabled!"
-
-            # 2. Score Rule
-            # RugCheck scores: 0 (Good) to ~10000 (Bad). 
-            # We use a strict threshold of 2000.
-            if score > 2000:
-                return "UNSAFE", f"❌ Risk Score too high: {score}"
-
-            return "SAFE", f"✅ Score: {score} (Clean)"
-
-    except Exception as e:
-        logging.error(f"RugCheck Error: {e}")
-        # FAILSAFE: If security check fails, assume UNSAFE to protect funds.
-        return "UNSAFE", "⚠️ Security Check Failed (Network Error)"
-
-async def get_market_data(ca: str):
-    """
-    Step B: Fetches live price, liquidity, and volume from DexScreener.
-    """
-    url = config.DEXSCREENER_API.format(ca)
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(url, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                if not data.get("pairs"): return None
+        async with aiohttp.ClientSession() as session:
+            async with session.get(DEX_API.format(ca)) as resp:
+                if resp.status != 200: return None
+                data = await resp.json()
                 
-                # Get the main pair (usually the first one)
+                if not data.get("pairs"): return None
                 pair = data["pairs"][0]
+                
                 return {
                     "priceUsd": float(pair.get("priceUsd", 0)),
                     "liquidity": pair.get("liquidity", {}).get("usd", 0),
                     "volume_5m": pair.get("volume", {}).get("m5", 0),
-                    "volume_1h": pair.get("volume", {}).get("h1", 0),
-                    "txns_5m_buys": pair.get("txns", {}).get("m5", {}).get("buys", 0),
-                    "txns_5m_sells": pair.get("txns", {}).get("m5", {}).get("sells", 0),
-                    "fdv": pair.get("fdv", 0)
+                    "fdv": pair.get("fdv", 0),
+                    "pairAddress": pair.get("pairAddress")
                 }
     except Exception as e:
-        logging.error(f"DexScreener Error: {e}")
+        logging.error(f"Market Data Error: {e}")
         return None
+
+async def get_rugcheck_report(ca):
+    """
+    Fetches Security Report from RugCheck.xyz
+    Returns: (Verdict, Details_String, Risk_Score, Top10_Holders_Pct)
+    """
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(RUGCHECK_API.format(ca)) as resp:
+                if resp.status != 200:
+                    return "UNKNOWN", "⚠️ Security Check Failed (API Error)", 0, 0
+                
+                data = await resp.json()
+                
+                # Extract Risk Score (0-10000 usually)
+                score = data.get("score", 0)
+                
+                # Extract Risks
+                risks = data.get("risks", [])
+                risk_level = "SAFE"
+                risk_msg = "✅ Token looks clean."
+                
+                # Determine Verdict
+                if score > 2000: # RugCheck arbitrary threshold for "Danger"
+                    risk_level = "DANGER"
+                    risk_msg = "⛔ High Risk Detected!"
+                elif score > 500:
+                    risk_level = "WARNING"
+                    risk_msg = "wm Caution Advised."
+                
+                # Holder Distribution
+                top_holders = data.get("topHolders", [])
+                total_pct = sum(float(h.get("pct", 0)) for h in top_holders[:10])
+                
+                # Create Report String
+                details = f"Risk Score: {score}\n"
+                if risks:
+                    details += "⚠️ **Risks:**\n"
+                    for r in risks[:3]: # Show top 3 risks
+                        details += f"- {r.get('name')}: {r.get('description')}\n"
+                
+                details += f"👥 **Top 10 Holders:** {total_pct:.1f}% Supply"
+                
+                return risk_level, details, score, total_pct
+
+    except Exception as e:
+        logging.error(f"RugCheck Error: {e}")
+        return "UNKNOWN", "⚠️ Check Failed", 0, 0
