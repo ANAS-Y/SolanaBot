@@ -1,8 +1,13 @@
 import aiosqlite
 import logging
 import key_manager
+import os
 
-DB_NAME = "sentinel.db"
+# If running on Render with a disk, save there. Otherwise, save locally.
+if os.path.exists("/data"):
+    DB_NAME = "/data/sentinel.db"
+else:
+    DB_NAME = "sentinel.db"
 
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
