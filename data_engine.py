@@ -1,78 +1,75 @@
 import aiohttp
 import logging
 
-# RugCheck Public API
+# APIs
 RUGCHECK_API = "https://api.rugcheck.xyz/v1/tokens/{}/report"
-# DexScreener API
 DEX_API = "https://api.dexscreener.com/latest/dex/tokens/{}"
+JUP_PRICE_API = "https://api.jup.ag/price/v2?ids=So11111111111111111111111111111111111111112"
+
+async def get_sol_price():
+    """Fetches current SOL price in USD"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(JUP_PRICE_API) as resp:
+                data = await resp.json()
+                price = data['data']['So11111111111111111111111111111111111111112']['price']
+                return float(price)
+    except:
+        return 0.0
 
 async def get_market_data(ca):
-    """
-    Fetches Price, Liquidity, Volume, and Transaction Counts from DexScreener.
-    """
+    """Fetches Token Market Data"""
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(DEX_API.format(ca)) as resp:
                 if resp.status != 200: return None
                 data = await resp.json()
-                
                 if not data.get("pairs"): return None
                 pair = data["pairs"][0]
                 
-                # Extract Transaction Counts (The missing piece)
-                txns = pair.get("txns", {})
-                m5_txns = txns.get("m5", {})
-                
+                base = pair.get("baseToken", {})
+                txns = pair.get("txns", {}).get("m5", {})
+
                 return {
                     "priceUsd": float(pair.get("priceUsd", 0)),
                     "liquidity": pair.get("liquidity", {}).get("usd", 0),
                     "volume_5m": pair.get("volume", {}).get("m5", 0),
                     "fdv": pair.get("fdv", 0),
-                    "pairAddress": pair.get("pairAddress"),
-                    # These were missing and causing the KeyError:
-                    "txns_5m_buys": m5_txns.get("buys", 0),
-                    "txns_5m_sells": m5_txns.get("sells", 0)
+                    "name": base.get("name", "Unknown"),
+                    "symbol": base.get("symbol", "UNK"),
+                    "buys_5m": txns.get("buys", 0),
+                    "sells_5m": txns.get("sells", 0)
                 }
     except Exception as e:
         logging.error(f"Market Data Error: {e}")
         return None
 
 async def get_rugcheck_report(ca):
-    """
-    Fetches Security Report from RugCheck.xyz
-    Returns: (Verdict, Details_String, Risk_Score, Top10_Holders_Pct)
-    """
+    """Fetches Security Report"""
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(RUGCHECK_API.format(ca)) as resp:
-                if resp.status != 200:
-                    return "UNKNOWN", "⚠️ Security Check Failed (API Error)", 0, 0
+                if resp.status != 200: return "UNKNOWN", "⚠️ Check Failed", 0, 0
                 
                 data = await resp.json()
-                
                 score = data.get("score", 0)
                 risks = data.get("risks", [])
                 
-                # Verdict Logic
                 risk_level = "SAFE"
                 if score > 2000: risk_level = "DANGER"
                 elif score > 500: risk_level = "WARNING"
                 
-                # Holder Distribution
                 top_holders = data.get("topHolders", [])
                 total_pct = sum(float(h.get("pct", 0)) for h in top_holders[:10])
                 
-                # Detailed Report
+                # Format for HTML
                 details = f"Risk Score: {score}\n"
                 if risks:
-                    details += "⚠️ **Risks:**\n"
-                    for r in risks[:3]:
+                    details += "<b>Risks Found:</b>\n"
+                    for r in risks[:2]:
                         details += f"- {r.get('name')}\n"
-                
-                details += f"👥 **Top 10 Holders:** {total_pct:.1f}%"
+                details += f"<b>Top 10 Holders:</b> {total_pct:.1f}%"
                 
                 return risk_level, details, score, total_pct
-
-    except Exception as e:
-        logging.error(f"RugCheck Error: {e}")
-        return "UNKNOWN", "⚠️ Check Failed", 0, 0
+    except:
+        return "UNKNOWN", "⚠️ Error", 0, 0
