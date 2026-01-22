@@ -37,8 +37,10 @@ async def get_market_data(ca):
                     "fdv": pair.get("fdv", 0),
                     "name": base.get("name", "Unknown"),
                     "symbol": base.get("symbol", "UNK"),
-                    "buys_5m": txns.get("buys", 0),
-                    "sells_5m": txns.get("sells", 0)
+                    "pairAddress": pair.get("pairAddress"),
+                    # FIXED KEYS below to match sentinel_ai.py
+                    "txns_5m_buys": txns.get("buys", 0),
+                    "txns_5m_sells": txns.get("sells", 0)
                 }
     except Exception as e:
         logging.error(f"Market Data Error: {e}")

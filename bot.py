@@ -17,10 +17,6 @@ import jupiter as jup
 
 # --- LOGGING ---
 logging.basicConfig(level=logging.INFO)
-
-if not config.BOT_TOKEN:
-    sys.exit("CRITICAL: BOT_TOKEN is missing.")
-
 bot = Bot(token=config.BOT_TOKEN)
 dp = Dispatcher()
 
@@ -49,7 +45,7 @@ class BotStates(StatesGroup):
 # --- MENUS ---
 def get_main_menu():
     return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="🧠 Analyze Token"), KeyboardButton(text="💰 Wallet")],
+        [KeyboardButton(text="🧠 New Analysis"), KeyboardButton(text="💰 Wallet")],
         [KeyboardButton(text="📊 Active Trades"), KeyboardButton(text="⚙️ Settings")],
         [KeyboardButton(text="❌ Cancel")]
     ], resize_keyboard=True)
@@ -74,76 +70,33 @@ def get_trade_panel(balance_sol, sol_price):
         [InlineKeyboardButton(text="❌ Close", callback_data="close_panel")]
     ])
 
-def get_risk_panel():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⚠️ Trading Blocked", callback_data="blocked")],
-        [InlineKeyboardButton(text="🔙 Main Menu", callback_data="main_menu")]
-    ])
-
-# --- BACKGROUND MONITOR (Missing Function Restored) ---
+# --- MONITOR ---
 async def position_monitor():
-    """
-    Checks active trades for TP/SL and Auto-Sells if enabled.
-    This runs forever in the background.
-    """
     while True:
         try:
             trades = await db.get_active_trades()
             for trade in trades:
-                # 1. Get User Settings
                 settings = await db.get_settings(trade['user_id'])
-                tp_target = settings['take_profit']
-                sl_target = settings['stop_loss'] * -1 # Make negative
-                auto_sell = settings['auto_sell']
-
-                # 2. Get Live Market Data
+                tp, sl, auto = settings['take_profit'], settings['stop_loss'] * -1, settings['auto_sell']
                 market = await data_engine.get_market_data(trade['token_address'])
                 if not market: continue
                 
-                curr_price = market['priceUsd']
+                curr = market['priceUsd']
                 entry = trade['entry_price']
-                
-                # 3. Calculate PnL
                 if entry > 0:
-                    pnl = ((curr_price - entry) / entry) * 100
-                else:
-                    pnl = 0.0
+                    pnl = ((curr - entry) / entry) * 100
+                else: pnl = 0
 
-                # 4. Check Triggers
-                triggered = False
-                msg_type = ""
-                
-                if pnl >= tp_target:
-                    triggered = True
-                    msg_type = "🚀 <b>Take Profit Hit!</b>"
-                elif pnl <= sl_target:
-                    triggered = True
-                    msg_type = "🛑 <b>Stop Loss Hit!</b>"
-
-                # 5. Action
-                if triggered:
-                    if auto_sell:
-                        await bot.send_message(
-                            trade['user_id'], 
-                            f"{msg_type}\n"
-                            f"<b>Token:</b> <code>{market['name']}</code>\n"
-                            f"<b>PnL:</b> {pnl:.2f}%\n"
-                            f"✅ <i>Auto-Selling...</i>",
-                            parse_mode="HTML"
-                        )
-                        # Execute Sell Logic Here (Future Integration)
+                if pnl >= tp or pnl <= sl:
+                    msg = "🚀 TP Hit!" if pnl > 0 else "🛑 SL Hit!"
+                    if auto:
+                        await bot.send_message(trade['user_id'], f"{msg} PnL: {pnl:.2f}% (Auto-Sold)")
                         await db.close_trade(trade['id'])
-                    else:
-                        # Optional: Alert user manually (Logic to prevent spamming needed)
-                        pass 
-
         except Exception as e:
-            logging.error(f"Monitor Error: {e}")
-        
-        # Wait 15 seconds before next check
+            logging.error(f"Monitor: {e}")
         await asyncio.sleep(15)
 
-# --- GLOBAL HANDLERS ---
+# --- HANDLERS ---
 @dp.message(Command("start"), StateFilter("*"))
 async def start(m: types.Message, state: FSMContext):
     await state.clear()
@@ -164,166 +117,89 @@ async def cancel(m: types.Message, state: FSMContext):
 @dp.callback_query(F.data == "close_panel")
 async def close(c: types.CallbackQuery): await c.message.delete()
 
-# --- WALLET MENU ---
+# --- WALLET ---
 @dp.message(F.text == "💰 Wallet", StateFilter("*"))
 async def wallet_menu(m: types.Message, state: FSMContext):
-    await state.clear()
+    # Fix: Ensure state is not None before clearing
+    if state: await state.clear()
+    
     w = await db.get_wallet(m.from_user.id)
-    
     if not w:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🆕 Create New", callback_data="wallet_create")],
-            [InlineKeyboardButton(text="📥 Import Key", callback_data="wallet_import")]
-        ])
-        return await m.answer("❌ <b>No Wallet Found</b>\nConnect a wallet to begin.", reply_markup=kb, parse_mode="HTML")
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🆕 Create", callback_data="wallet_create"), InlineKeyboardButton(text="📥 Import", callback_data="wallet_import")]])
+        return await m.answer("❌ <b>No Wallet Found</b>", reply_markup=kb, parse_mode="HTML")
     
-    msg = await m.answer("⏳ <i>Syncing Blockchain...</i>", parse_mode="HTML")
-    
+    msg = await m.answer("⏳ <i>Syncing...</i>", parse_mode="HTML")
     bal_lamports = await jup.get_sol_balance(config.RPC_URL, w[2])
     bal_sol = bal_lamports / 1e9
     sol_price = await data_engine.get_sol_price()
     
     info = (
-        f"💰 <b>Wallet Dashboard</b>\n"
-        f"──────────────────\n"
+        f"💰 <b>Wallet Dashboard</b>\n──────────────────\n"
         f"<b>Address:</b> <code>{w[2]}</code>\n\n"
         f"<b>Balance:</b> {bal_sol:.4f} SOL\n"
-        f"<b>Value:</b>   ${(bal_sol * sol_price):.2f} USD\n"
-        f"──────────────────"
+        f"<b>Value:</b>   ${(bal_sol * sol_price):.2f} USD\n──────────────────"
     )
-    
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💸 Withdraw", callback_data="withdraw_start"), InlineKeyboardButton(text="🔑 View Key", callback_data="export_key")],
+        [InlineKeyboardButton(text="💸 Withdraw", callback_data="withdraw_start"), InlineKeyboardButton(text="🔑 Key", callback_data="export_key")],
         [InlineKeyboardButton(text="🔄 Refresh", callback_data="refresh_wallet"), InlineKeyboardButton(text="🔙 Menu", callback_data="main_menu")]
     ])
-    
     await msg.delete()
     await m.answer(info, reply_markup=kb, parse_mode="HTML")
 
 @dp.callback_query(F.data == "refresh_wallet")
-async def refresh_wallet(c: types.CallbackQuery):
-    await wallet_menu(c.message, None) 
+async def refresh_wallet(c: types.CallbackQuery, state: FSMContext): # Fixed: Added state
+    await wallet_menu(c.message, state) 
     await c.answer("Refreshed")
 
-# --- ACTIVE TRADES ---
-@dp.message(F.text == "📊 Active Trades", StateFilter("*"))
-async def active_trades(m: types.Message):
-    trades = await db.get_active_trades()
-    user_trades = [t for t in trades if t['user_id'] == m.from_user.id]
-    
-    if not user_trades:
-        return await m.answer("💤 <b>No Active Positions.</b>", parse_mode="HTML")
-    
-    status = await m.answer("⏳ <i>Fetching Live Prices...</i>", parse_mode="HTML")
-    sol_price = await data_engine.get_sol_price()
-    
-    text = "📊 <b>Active Portfolio</b>\n──────────────────\n"
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[])
-    
-    for t in user_trades:
-        market = await data_engine.get_market_data(t['token_address'])
-        if not market: continue
-        
-        invested_sol = t['amount_sol']
-        invested_usd = invested_sol * sol_price
-        curr_price = market['priceUsd']
-        entry_price = t['entry_price']
-        
-        if entry_price > 0:
-            pnl_pct = ((curr_price - entry_price) / entry_price) * 100
-        else:
-            pnl_pct = 0.0
-        
-        emoji = "🟢" if pnl_pct >= 0 else "🔴"
-        
-        # Format Market Cap (FDV)
-        mcap = market['fdv']
-        if mcap > 1_000_000: mcap_str = f"${mcap/1_000_000:.1f}M"
-        elif mcap > 1_000: mcap_str = f"${mcap/1_000:.1f}K"
-        else: mcap_str = f"${mcap:.0f}"
-
-        text += (
-            f"🔹 <b>{market['name']}</b> ({market['symbol']})\n"
-            f"   Invested: {invested_sol:.2f} SOL (${invested_usd:.0f})\n"
-            f"   PnL:      {emoji} {pnl_pct:+.2f}%\n"
-            f"   MCap:     {mcap_str}\n"
-            f"──────────────────\n"
-        )
-        
-        kb.inline_keyboard.append([
-            InlineKeyboardButton(text=f"Sell {market['symbol']}", callback_data=f"sell_manual_{t['id']}")
-        ])
-    
-    kb.inline_keyboard.append([InlineKeyboardButton(text="🔙 Menu", callback_data="main_menu")])
-    
-    await status.delete()
-    await m.answer(text, reply_markup=kb, parse_mode="HTML")
-
-@dp.callback_query(F.data.startswith("sell_manual_"))
-async def manual_sell(c: types.CallbackQuery):
-    trade_id = int(c.data.split("_")[2])
-    await db.close_trade(trade_id)
-    await c.message.edit_text("✅ <b>Position Sold/Closed.</b>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Menu", callback_data="main_menu")]]))
-
-# --- ANALYZE & BUY ---
-@dp.message(F.text == "🧠 Analyze Token", StateFilter("*"))
+# --- ANALYZE ---
+@dp.message(F.text == "🧠 New Analysis", StateFilter("*")) # Updated Label
 async def analyze_start(m: types.Message, state: FSMContext):
     await state.clear()
-    await m.answer("📝 <b>Paste Token Address (CA):</b>", reply_markup=get_cancel_kb(), parse_mode="HTML")
+    await m.answer("📝 <b>Paste Token Address:</b>", reply_markup=get_cancel_kb(), parse_mode="HTML")
     await state.set_state(BotStates.waiting_for_token)
 
 @dp.message(BotStates.waiting_for_token)
 async def analyze_process(m: types.Message, state: FSMContext):
     ca = m.text.strip()
-    if len(ca) < 30: return await m.answer("❌ Invalid Address.")
+    if len(ca) < 30: return await m.answer("❌ Invalid.")
 
-    status = await m.answer("🔎 <i>Scanning Token Security...</i>", parse_mode="HTML")
-    
+    status = await m.answer("🔎 <i>Scanning...</i>", parse_mode="HTML")
     verdict, details, risk_score, holder_pct = await data_engine.get_rugcheck_report(ca)
     market = await data_engine.get_market_data(ca)
     sol_price = await data_engine.get_sol_price()
     
     if not market:
         await status.delete()
-        await m.answer("❌ <b>Data Unavailable</b>\nToken might be too new.", parse_mode="HTML")
+        await m.answer("❌ No Data.", parse_mode="HTML")
         return
 
     if verdict == "DANGER" or risk_score > 5000 or holder_pct > 60:
         await status.delete()
-        await m.answer(f"⛔ <b>TRADING BLOCKED</b>\nReason: High Risk.\n\n{details}", parse_mode="HTML", reply_markup=get_risk_panel())
+        await m.answer(f"⛔ <b>BLOCKED</b>\nReason: High Risk.\n\n{details}", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Menu", callback_data="main_menu")]]))
         return
 
+    # AI Analysis (Now passing correct keys from data_engine)
     ai_verdict, ai_reason = await sentinel_ai.analyze_token(ca, verdict, market)
     
     w = await db.get_wallet(m.from_user.id)
     bal_sol = 0.0
-    if w:
-        bal_sol = (await jup.get_sol_balance(config.RPC_URL, w[2])) / 1e9
+    if w: bal_sol = (await jup.get_sol_balance(config.RPC_URL, w[2])) / 1e9
     
     await state.update_data(active_token=ca, active_price=market['priceUsd'], balance=bal_sol, sol_price=sol_price)
-    
-    s = await db.get_settings(m.from_user.id)
     await status.delete()
 
+    s = await db.get_settings(m.from_user.id)
     if s['auto_buy']:
-        await m.answer(
-            f"✅ <b>Safe - Auto Buy Active</b>\nToken: <code>{market['name']}</code>\n👇 <b>Select Investment Amount:</b>",
-            reply_markup=get_trade_panel(bal_sol, sol_price),
-            parse_mode="HTML"
-        )
+        await m.answer(f"✅ <b>Safe - Auto Buy</b>\nToken: <code>{market['name']}</code>\n👇 <b>Select Amount:</b>", reply_markup=get_trade_panel(bal_sol, sol_price), parse_mode="HTML")
     else:
         emoji = "🟢" if ai_verdict == "BUY" else "🟡"
         report = (
-            f"{emoji} <b>Analysis Report</b>\n"
-            f"──────────────────\n"
+            f"{emoji} <b>Analysis Report</b>\n──────────────────\n"
             f"<b>Token:</b> {market['name']} ({market['symbol']})\n"
             f"<b>Price:</b> ${market['priceUsd']:.6f}\n"
-            f"<b>MCap:</b>  ${market['fdv']:,.0f}\n"
-            f"──────────────────\n"
+            f"<b>MCap:</b>  ${market['fdv']:,.0f}\n──────────────────\n"
             f"🛡️ <b>Security:</b>\n{details}\n\n"
-            f"🧠 <b>AI Verdict:</b> {ai_reason}\n"
-            f"──────────────────\n"
+            f"🧠 <b>AI Verdict:</b> {ai_reason}\n──────────────────\n"
             f"👇 <b>Select Action:</b>"
         )
         await m.answer(report, reply_markup=get_trade_panel(bal_sol, sol_price), parse_mode="HTML")
@@ -340,7 +216,6 @@ async def buy_handler(c: types.CallbackQuery, state: FSMContext):
 
     data = await state.get_data()
     bal = data.get("balance", 0.0)
-    
     amt = 0.0
     if mode == "25": amt = bal * 0.25
     elif mode == "50": amt = bal * 0.50
@@ -388,7 +263,57 @@ async def execute_trade(message_obj, state, amount_sol):
     )
     await state.clear()
 
-# --- SETTINGS, KEY MGMT, ETC ---
+# --- ACTIVE TRADES ---
+@dp.message(F.text == "📊 Active Trades", StateFilter("*"))
+async def active_trades(m: types.Message):
+    trades = await db.get_active_trades()
+    user_trades = [t for t in trades if t['user_id'] == m.from_user.id]
+    
+    if not user_trades:
+        return await m.answer("💤 <b>No Active Positions.</b>", parse_mode="HTML")
+    
+    status = await m.answer("⏳ <i>Fetching Live Prices...</i>", parse_mode="HTML")
+    sol_price = await data_engine.get_sol_price()
+    
+    text = "📊 <b>Active Portfolio</b>\n──────────────────\n"
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+    
+    for t in user_trades:
+        market = await data_engine.get_market_data(t['token_address'])
+        if not market: continue
+        
+        invested_sol = t['amount_sol']
+        invested_usd = invested_sol * sol_price
+        curr_price = market['priceUsd']
+        entry_price = t['entry_price']
+        
+        if entry_price > 0:
+            pnl_pct = ((curr_price - entry_price) / entry_price) * 100
+        else: pnl_pct = 0.0
+        
+        emoji = "🟢" if pnl_pct >= 0 else "🔴"
+        mcap = market['fdv']
+        mcap_str = f"${mcap/1_000_000:.1f}M" if mcap >= 1e6 else f"${mcap/1_000:.1f}K"
+
+        text += (
+            f"🔹 <b>{market['name']}</b> ({market['symbol']})\n"
+            f"   Invested: {invested_sol:.2f} SOL (${invested_usd:.0f})\n"
+            f"   PnL:      {emoji} {pnl_pct:+.2f}%\n"
+            f"   MCap:     {mcap_str}\n──────────────────\n"
+        )
+        kb.inline_keyboard.append([InlineKeyboardButton(text=f"Sell {market['symbol']}", callback_data=f"sell_manual_{t['id']}")])
+    
+    kb.inline_keyboard.append([InlineKeyboardButton(text="🔙 Menu", callback_data="main_menu")])
+    await status.delete()
+    await m.answer(text, reply_markup=kb, parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("sell_manual_"))
+async def manual_sell(c: types.CallbackQuery):
+    trade_id = int(c.data.split("_")[2])
+    await db.close_trade(trade_id)
+    await c.message.edit_text("✅ <b>Position Sold/Closed.</b>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Menu", callback_data="main_menu")]]))
+
+# --- SETTINGS / WALLET CREATE ---
 @dp.message(F.text == "⚙️ Settings", StateFilter("*"))
 async def settings(m: types.Message): await show_settings_panel(m.from_user.id, m)
 
@@ -396,7 +321,7 @@ async def show_settings_panel(user_id, message_obj=None, edit_mode=False):
     s = await db.get_settings(user_id)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"💧 Slippage: {s['slippage']}%", callback_data="set_slippage")],
-        [InlineKeyboardButton(text=f"🚀 TP: +{s['take_profit']}%", callback_data="set_tp"), InlineKeyboardButton(text=f"🛑 SL: -{s['stop_loss']}%", callback_data="set_sl")],
+        [InlineKeyboardButton(text=f"🚀 TP: {s['take_profit']}%", callback_data="set_tp"), InlineKeyboardButton(text=f"🛑 SL: {s['stop_loss']}%", callback_data="set_sl")],
         [InlineKeyboardButton(text=f"🤖 Buy: {'ON' if s['auto_buy'] else 'OFF'}", callback_data="toggle_autobuy"), InlineKeyboardButton(text=f"📉 Sell: {'ON' if s['auto_sell'] else 'OFF'}", callback_data="toggle_autosell")],
         [InlineKeyboardButton(text=f"Mode: {'🧪 SIM' if s['simulation_mode'] else '💸 REAL'}", callback_data="toggle_sim")],
         [InlineKeyboardButton(text="🔙 Menu", callback_data="main_menu")]
@@ -442,11 +367,11 @@ async def save_setting(m, state, col, min_v, max_v):
 async def w_create(c: types.CallbackQuery):
     priv, pub = jup.create_new_wallet()
     await db.add_wallet(c.from_user.id, priv, pub)
-    await c.message.edit_text(f"✅ Created!\nAddress: <code>{pub}</code>", parse_mode="HTML")
+    await c.message.edit_text(f"✅ Created!\n`{pub}`", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Menu", callback_data="main_menu")]]))
 
 @dp.callback_query(F.data == "wallet_import")
 async def w_import(c: types.CallbackQuery, state: FSMContext):
-    await c.message.answer("📥 <b>Paste Key:</b>", reply_markup=get_cancel_kb(), parse_mode="HTML")
+    await c.message.answer("📥 **Paste Key:**", reply_markup=get_cancel_kb())
     await state.set_state(BotStates.waiting_for_import_key)
 
 @dp.message(BotStates.waiting_for_import_key)
@@ -468,14 +393,14 @@ async def export(c: types.CallbackQuery):
 
 @dp.callback_query(F.data == "withdraw_start")
 async def with_start(c: types.CallbackQuery, state: FSMContext):
-    await c.message.answer("💸 <b>Amount:</b>", reply_markup=get_cancel_kb(), parse_mode="HTML")
+    await c.message.answer("💸 **Amount:**", reply_markup=get_cancel_kb())
     await state.set_state(BotStates.waiting_for_withdraw_amt)
 
 @dp.message(BotStates.waiting_for_withdraw_amt)
 async def with_amt(m: types.Message, state: FSMContext):
     try:
         await state.update_data(amt=float(m.text))
-        await m.answer("Cb <b>Address:</b>", reply_markup=get_cancel_kb(), parse_mode="HTML")
+        await m.answer("Cb **Address:**", reply_markup=get_cancel_kb())
         await state.set_state(BotStates.waiting_for_withdraw_addr)
     except: await m.answer("❌ Invalid.")
 
@@ -499,4 +424,3 @@ async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__": asyncio.run(main())
-
