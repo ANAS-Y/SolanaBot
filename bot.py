@@ -60,23 +60,23 @@ def get_trade_panel(balance_sol, sol_price):
 
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text=f"25% (${qtr*sol_price:.0f})", callback_data="buy_25"),
-            InlineKeyboardButton(text=f"50% (${half*sol_price:.0f})", callback_data="buy_50")
+            InlineKeyboardButton(text=f"25% (${qtr*sol_price:.2f})", callback_data="buy_25"),
+            InlineKeyboardButton(text=f"50% (${half*sol_price:.2f})", callback_data="buy_50")
         ],
         [
-            InlineKeyboardButton(text=f"Max (${max_amt*sol_price:.0f})", callback_data="buy_max"),
+            InlineKeyboardButton(text=f"Max (${max_amt*sol_price:.2f})", callback_data="buy_max"),
             InlineKeyboardButton(text="⌨️ Custom Amount", callback_data="buy_custom")
         ],
         [InlineKeyboardButton(text="❌ Close", callback_data="close_panel")]
     ])
 
-# --- MONITOR (REAL AUTO-SELL) ---
+# --- MONITOR ---
 async def position_monitor():
     while True:
         try:
             trades = await db.get_active_trades()
             sol_price = await data_engine.get_sol_price()
-            if sol_price == 0: sol_price = 150.0 
+            if not sol_price: sol_price = 0.0
 
             for trade in trades:
                 settings = await db.get_settings(trade['user_id'])
@@ -105,7 +105,6 @@ async def position_monitor():
                 if triggered:
                     user_id = trade['user_id']
                     
-                    # Calculate estimated Sell Value
                     invested_sol = trade['amount_sol']
                     current_val_sol = invested_sol * (1 + (pnl/100))
                     current_val_usd = current_val_sol * sol_price
@@ -118,7 +117,8 @@ async def position_monitor():
                                 trade['token_address'], 
                                 jup.SOL_MINT,           
                                 trade['token_amount'],  
-                                slippage=settings['slippage'] * 100
+                                slippage=settings['slippage'] * 100,
+                                is_simulation=settings['simulation_mode']
                             )
                             
                             status = "✅ <b>Sold!</b>" if success else f"❌ <b>Fail:</b> {tx_sig}"
@@ -184,7 +184,9 @@ async def wallet_menu(m: types.Message, state: FSMContext):
     msg = await m.answer("⏳ <i>Syncing...</i>", parse_mode="HTML")
     bal_lamports = await jup.get_sol_balance(config.RPC_URL, w[2])
     bal_sol = bal_lamports / 1e9
+    
     sol_price = await data_engine.get_sol_price()
+    if not sol_price: sol_price = 0.0 # SAFETY FIX
     
     info = (
         f"💰 <b>Wallet Dashboard</b>\n──────────────────\n"
@@ -219,7 +221,6 @@ async def analyze_process(m: types.Message, state: FSMContext):
     status = await m.answer("🔎 <i>Scanning...</i>", parse_mode="HTML")
     verdict, details, risk_score, holder_pct = await data_engine.get_rugcheck_report(ca)
     market = await data_engine.get_market_data(ca)
-    sol_price = await data_engine.get_sol_price()
     
     if not market:
         await status.delete()
@@ -233,10 +234,12 @@ async def analyze_process(m: types.Message, state: FSMContext):
 
     ai_verdict, ai_reason = await sentinel_ai.analyze_token(ca, verdict, market)
     
-    # Get Wallet for balance check
     w = await db.get_wallet(m.from_user.id)
     bal_sol = 0.0
     if w: bal_sol = (await jup.get_sol_balance(config.RPC_URL, w[2])) / 1e9
+    
+    sol_price = await data_engine.get_sol_price()
+    if not sol_price: sol_price = 0.0 # SAFETY FIX
     
     await state.update_data(active_token=ca, active_price=market['priceUsd'], balance=bal_sol, sol_price=sol_price)
     await status.delete()
@@ -257,7 +260,7 @@ async def analyze_process(m: types.Message, state: FSMContext):
         )
         await m.answer(report, reply_markup=get_trade_panel(bal_sol, sol_price), parse_mode="HTML")
 
-# --- BUY EXECUTION (FIXED USER ID) ---
+# --- BUY EXECUTION ---
 @dp.callback_query(F.data.startswith("buy_"))
 async def buy_handler(c: types.CallbackQuery, state: FSMContext):
     mode = c.data.split("_")[1]
@@ -274,7 +277,6 @@ async def buy_handler(c: types.CallbackQuery, state: FSMContext):
     elif mode == "50": amt = bal * 0.50
     elif mode == "max": amt = max(0, bal - 0.01)
     
-    # PASS CORRECT USER ID (c.from_user.id)
     await execute_trade(c.message, state, amt, c.from_user.id)
     await c.answer()
 
@@ -289,15 +291,10 @@ async def custom_buy_process(m: types.Message, state: FSMContext):
             sol = usd / sol_price
         else:
             sol = float(text)
-        # PASS CORRECT USER ID (m.from_user.id)
         await execute_trade(m, state, sol, m.from_user.id)
     except: await m.answer("❌ Invalid Amount.", parse_mode="HTML")
 
 async def execute_trade(message_obj, state, amount_sol, user_id):
-    """
-    Executes the trade. 
-    Crucial Fix: user_id is now passed explicitly to find the correct wallet.
-    """
     data = await state.get_data()
     ca = data.get("active_token")
     price = data.get("active_price")
@@ -305,7 +302,6 @@ async def execute_trade(message_obj, state, amount_sol, user_id):
     
     if amount_sol <= 0: return await message_obj.answer("❌ Insufficient Funds.")
 
-    # --- CRASH FIX: Check for wallet existence using CORRECT User ID ---
     wallet = await db.get_wallet(user_id)
     if not wallet:
         return await message_obj.answer("❌ <b>Wallet Error</b>\nWallet not found for this user. Please import Key.", parse_mode="HTML")
@@ -351,7 +347,7 @@ async def active_trades(m: types.Message):
     
     status = await m.answer("⏳ <i>Fetching Prices...</i>", parse_mode="HTML")
     sol_price = await data_engine.get_sol_price()
-    if sol_price == 0: sol_price = 150.0
+    if not sol_price: sol_price = 0.0 # SAFETY FIX
     
     text = "📊 <b>Active Portfolio</b>\n──────────────────\n"
     kb = InlineKeyboardMarkup(inline_keyboard=[])

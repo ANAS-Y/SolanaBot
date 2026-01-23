@@ -12,7 +12,7 @@ async def get_sol_price():
     try:
         # Try Jupiter First
         async with aiohttp.ClientSession() as session:
-            async with session.get(JUP_PRICE_API) as resp:
+            async with session.get(JUP_PRICE_API, timeout=5) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     return float(data['data']['So11111111111111111111111111111111111111112']['price'])
@@ -22,18 +22,20 @@ async def get_sol_price():
     try:
         # Fallback to CoinGecko
         async with aiohttp.ClientSession() as session:
-            async with session.get(CG_PRICE_API) as resp:
+            async with session.get(CG_PRICE_API, timeout=5) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     return float(data['solana']['usd'])
     except:
-        return 0.0
+        pass
+        
+    return 0.0 # <--- CRITICAL FIX: Always return a float, never None
 
 async def get_market_data(ca):
     """Fetches Token Market Data"""
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(DEX_API.format(ca)) as resp:
+            async with session.get(DEX_API.format(ca), timeout=10) as resp:
                 if resp.status != 200: return None
                 data = await resp.json()
                 if not data.get("pairs"): return None
@@ -61,7 +63,7 @@ async def get_rugcheck_report(ca):
     """Fetches Security Report"""
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(RUGCHECK_API.format(ca)) as resp:
+            async with session.get(RUGCHECK_API.format(ca), timeout=10) as resp:
                 if resp.status != 200: return "UNKNOWN", "⚠️ Check Failed", 0, 0
                 
                 data = await resp.json()
