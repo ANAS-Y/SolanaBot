@@ -5,15 +5,27 @@ import logging
 RUGCHECK_API = "https://api.rugcheck.xyz/v1/tokens/{}/report"
 DEX_API = "https://api.dexscreener.com/latest/dex/tokens/{}"
 JUP_PRICE_API = "https://api.jup.ag/price/v2?ids=So11111111111111111111111111111111111111112"
+CG_PRICE_API = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"
 
 async def get_sol_price():
-    """Fetches current SOL price in USD"""
+    """Fetches current SOL price (Jupiter -> CoinGecko Fallback)"""
     try:
+        # Try Jupiter First
         async with aiohttp.ClientSession() as session:
             async with session.get(JUP_PRICE_API) as resp:
-                data = await resp.json()
-                price = data['data']['So11111111111111111111111111111111111111112']['price']
-                return float(price)
+                if resp.status == 200:
+                    data = await resp.json()
+                    return float(data['data']['So11111111111111111111111111111111111111112']['price'])
+    except:
+        pass
+    
+    try:
+        # Fallback to CoinGecko
+        async with aiohttp.ClientSession() as session:
+            async with session.get(CG_PRICE_API) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return float(data['solana']['usd'])
     except:
         return 0.0
 
@@ -38,7 +50,6 @@ async def get_market_data(ca):
                     "name": base.get("name", "Unknown"),
                     "symbol": base.get("symbol", "UNK"),
                     "pairAddress": pair.get("pairAddress"),
-                    # FIXED KEYS below to match sentinel_ai.py
                     "txns_5m_buys": txns.get("buys", 0),
                     "txns_5m_sells": txns.get("sells", 0)
                 }

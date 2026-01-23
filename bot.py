@@ -70,14 +70,12 @@ def get_trade_panel(balance_sol, sol_price):
         [InlineKeyboardButton(text="❌ Close", callback_data="close_panel")]
     ])
 
-# --- MONITOR (FIXED USD DISPLAY) ---
+# --- MONITOR (REAL AUTO-SELL) ---
 async def position_monitor():
     while True:
         try:
             trades = await db.get_active_trades()
             sol_price = await data_engine.get_sol_price()
-            
-            # Fallback if API fails
             if sol_price == 0: sol_price = 150.0 
 
             for trade in trades:
@@ -109,7 +107,6 @@ async def position_monitor():
                     
                     # Calculate estimated Sell Value
                     invested_sol = trade['amount_sol']
-                    # Current Value = Invested * (1 + PnL%)
                     current_val_sol = invested_sol * (1 + (pnl/100))
                     current_val_usd = current_val_sol * sol_price
 
@@ -188,7 +185,6 @@ async def wallet_menu(m: types.Message, state: FSMContext):
     bal_lamports = await jup.get_sol_balance(config.RPC_URL, w[2])
     bal_sol = bal_lamports / 1e9
     sol_price = await data_engine.get_sol_price()
-    if sol_price == 0: sol_price = 0 # Prevent crash if API fails
     
     info = (
         f"💰 <b>Wallet Dashboard</b>\n──────────────────\n"
@@ -205,7 +201,7 @@ async def wallet_menu(m: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data == "refresh_wallet")
 async def refresh_wallet(c: types.CallbackQuery, state: FSMContext):
-    await c.answer("Refreshed") # Answer first to prevent timeout
+    await c.answer("Refreshed") 
     await wallet_menu(c.message, state)
 
 # --- ANALYZE ---
@@ -261,7 +257,7 @@ async def analyze_process(m: types.Message, state: FSMContext):
         )
         await m.answer(report, reply_markup=get_trade_panel(bal_sol, sol_price), parse_mode="HTML")
 
-# --- BUY EXECUTION (FIXED CRASH) ---
+# --- BUY EXECUTION (FIXED USER ID) ---
 @dp.callback_query(F.data.startswith("buy_"))
 async def buy_handler(c: types.CallbackQuery, state: FSMContext):
     mode = c.data.split("_")[1]
@@ -278,7 +274,8 @@ async def buy_handler(c: types.CallbackQuery, state: FSMContext):
     elif mode == "50": amt = bal * 0.50
     elif mode == "max": amt = max(0, bal - 0.01)
     
-    await execute_trade(c.message, state, amt)
+    # PASS CORRECT USER ID (c.from_user.id)
+    await execute_trade(c.message, state, amt, c.from_user.id)
     await c.answer()
 
 @dp.message(BotStates.waiting_for_custom_buy)
@@ -292,10 +289,15 @@ async def custom_buy_process(m: types.Message, state: FSMContext):
             sol = usd / sol_price
         else:
             sol = float(text)
-        await execute_trade(m, state, sol)
+        # PASS CORRECT USER ID (m.from_user.id)
+        await execute_trade(m, state, sol, m.from_user.id)
     except: await m.answer("❌ Invalid Amount.", parse_mode="HTML")
 
-async def execute_trade(message_obj, state, amount_sol):
+async def execute_trade(message_obj, state, amount_sol, user_id):
+    """
+    Executes the trade. 
+    Crucial Fix: user_id is now passed explicitly to find the correct wallet.
+    """
     data = await state.get_data()
     ca = data.get("active_token")
     price = data.get("active_price")
@@ -303,12 +305,10 @@ async def execute_trade(message_obj, state, amount_sol):
     
     if amount_sol <= 0: return await message_obj.answer("❌ Insufficient Funds.")
 
-    user_id = message_obj.from_user.id
-    
-    # --- CRASH FIX: Check for wallet existence ---
+    # --- CRASH FIX: Check for wallet existence using CORRECT User ID ---
     wallet = await db.get_wallet(user_id)
     if not wallet:
-        return await message_obj.answer("❌ <b>Wallet Error</b>\nWallet not found. Please import your key in the Wallet menu.", parse_mode="HTML")
+        return await message_obj.answer("❌ <b>Wallet Error</b>\nWallet not found for this user. Please import Key.", parse_mode="HTML")
     
     s = await db.get_settings(user_id)
     mode_text = "🧪 SIMULATION" if s['simulation_mode'] else "💸 REAL"
@@ -351,6 +351,7 @@ async def active_trades(m: types.Message):
     
     status = await m.answer("⏳ <i>Fetching Prices...</i>", parse_mode="HTML")
     sol_price = await data_engine.get_sol_price()
+    if sol_price == 0: sol_price = 150.0
     
     text = "📊 <b>Active Portfolio</b>\n──────────────────\n"
     kb = InlineKeyboardMarkup(inline_keyboard=[])
@@ -374,7 +375,7 @@ async def active_trades(m: types.Message):
 
         text += (
             f"🔹 <b>{market['name']}</b> ({market['symbol']})\n"
-            f"   Invested: {invested_sol:.2f} SOL (${invested_usd:.2f})\n" # Added USD here
+            f"   Invested: {invested_sol:.2f} SOL (${invested_usd:.2f})\n"
             f"   PnL:      {emoji} {pnl_pct:+.2f}%\n"
             f"   MCap:     {mcap_str}\n──────────────────\n"
         )
