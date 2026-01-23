@@ -1,5 +1,6 @@
 import aiohttp
 import logging
+import asyncio
 
 # APIs
 RUGCHECK_API = "https://api.rugcheck.xyz/v1/tokens/{}/report"
@@ -7,35 +8,48 @@ DEX_API = "https://api.dexscreener.com/latest/dex/tokens/{}"
 JUP_PRICE_API = "https://api.jup.ag/price/v2?ids=So11111111111111111111111111111111111111112"
 CG_PRICE_API = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"
 
+# Global Cache to prevent flickering $0
+LAST_KNOWN_PRICE = 150.0 
+
 async def get_sol_price():
-    """Fetches current SOL price (Jupiter -> CoinGecko Fallback)"""
+    """
+    Fetches current SOL price with multiple fallbacks.
+    Never returns 0.0 or None.
+    """
+    global LAST_KNOWN_PRICE
+    
+    # Try 1: Jupiter
     try:
-        # Try Jupiter First
         async with aiohttp.ClientSession() as session:
             async with session.get(JUP_PRICE_API, timeout=5) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return float(data['data']['So11111111111111111111111111111111111111112']['price'])
+                    price = float(data['data']['So11111111111111111111111111111111111111112']['price'])
+                    LAST_KNOWN_PRICE = price
+                    return price
     except:
         pass
     
+    # Try 2: CoinGecko
     try:
-        # Fallback to CoinGecko
         async with aiohttp.ClientSession() as session:
             async with session.get(CG_PRICE_API, timeout=5) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return float(data['solana']['usd'])
+                    price = float(data['solana']['usd'])
+                    LAST_KNOWN_PRICE = price
+                    return price
     except:
         pass
         
-    return 0.0 # <--- CRITICAL FIX: Always return a float, never None
+    # Final Fallback: Return last known good price
+    return LAST_KNOWN_PRICE
 
 async def get_market_data(ca):
-    """Fetches Token Market Data"""
+    """Fetches Token Market Data with DNS Safety"""
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(DEX_API.format(ca), timeout=10) as resp:
+            async with session.get(DEX_API.format(ca), timeout=8) as resp:
                 if resp.status != 200: return None
                 data = await resp.json()
                 if not data.get("pairs"): return None
@@ -60,10 +74,9 @@ async def get_market_data(ca):
         return None
 
 async def get_rugcheck_report(ca):
-    """Fetches Security Report"""
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(RUGCHECK_API.format(ca), timeout=10) as resp:
+            async with session.get(RUGCHECK_API.format(ca), timeout=8) as resp:
                 if resp.status != 200: return "UNKNOWN", "⚠️ Check Failed", 0, 0
                 
                 data = await resp.json()
@@ -77,7 +90,6 @@ async def get_rugcheck_report(ca):
                 top_holders = data.get("topHolders", [])
                 total_pct = sum(float(h.get("pct", 0)) for h in top_holders[:10])
                 
-                # Format for HTML
                 details = f"Risk Score: {score}\n"
                 if risks:
                     details += "<b>Risks Found:</b>\n"
@@ -87,4 +99,4 @@ async def get_rugcheck_report(ca):
                 
                 return risk_level, details, score, total_pct
     except:
-        return "UNKNOWN", "⚠️ Error", 0, 0
+        return "UNKNOWN", "⚠️ Check Failed", 0, 0

@@ -12,9 +12,8 @@ from solders.transaction import VersionedTransaction
 from solders.message import MessageV0
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.types import TxOpts
-from solana.rpc.commitment import Confirmed
 
-# --- CONFIGURATION ---
+# Use a reliable RPC. The mainnet-beta URL can be rate limited.
 RPC_URL = "https://api.mainnet-beta.solana.com" 
 JUP_QUOTE_URL = "https://quote-api.jup.ag/v6/quote"
 JUP_SWAP_URL = "https://quote-api.jup.ag/v6/swap"
@@ -34,12 +33,9 @@ def get_keypair_from_input(input_str):
         if input_str.startswith("[") and input_str.endswith("]"):
             raw_bytes = json.loads(input_str)
             return Keypair.from_bytes(bytes(raw_bytes))
-        
-        # Try Base58
         decoded = base58.b58decode(input_str)
         return Keypair.from_bytes(decoded)
-    except Exception as e:
-        logging.error(f"Key Parse Error: {e}")
+    except:
         return None
 
 # --- BASIC OPS ---
@@ -48,7 +44,8 @@ async def get_sol_balance(rpc_url, pubkey_str):
         async with AsyncClient(rpc_url) as client:
             resp = await client.get_balance(Pubkey.from_string(pubkey_str))
             return resp.value
-    except:
+    except Exception as e:
+        logging.error(f"RPC Error: {e}")
         return 0
 
 async def transfer_sol(priv_key, to_address, amount_sol):
@@ -68,53 +65,50 @@ async def transfer_sol(priv_key, to_address, amount_sol):
             resp = await client.send_transaction(tx, opts=TxOpts(skip_preflight=True))
             return True, str(resp.value)
     except Exception as e:
-        return False, str(e)
+        return False, f"Net Error: {str(e)[:50]}"
 
-# --- REAL TRADING ENGINE ---
+# --- REAL TRADING ENGINE (Resilient) ---
 async def execute_swap(priv_key, input_mint, output_mint, amount_lamports, slippage=100, is_simulation=False):
-    """
-    Executes a REAL Swap on Solana via Jupiter.
-    """
     if is_simulation:
-        return True, "SIMULATED_TX_HASH_12345"
+        return True, "SIMULATED_TX_HASH"
 
     keypair = get_keypair_from_input(priv_key)
-    if not keypair: return False, "Invalid Private Key"
+    if not keypair: return False, "Invalid Key"
 
-    try:
-        async with httpx.AsyncClient() as client:
-            # 1. Get Quote
-            q_url = f"{JUP_QUOTE_URL}?inputMint={input_mint}&outputMint={output_mint}&amount={int(amount_lamports)}&slippageBps={slippage}"
-            quote_resp = await client.get(q_url)
-            if quote_resp.status_code != 200: return False, f"Quote Failed: {quote_resp.text}"
-            quote = quote_resp.json()
+    # Retry Logic for DNS/Network errors
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                # 1. Quote
+                q_url = f"{JUP_QUOTE_URL}?inputMint={input_mint}&outputMint={output_mint}&amount={int(amount_lamports)}&slippageBps={slippage}"
+                quote_resp = await client.get(q_url)
+                if quote_resp.status_code != 200: return False, f"Quote Failed: {quote_resp.text}"
+                quote = quote_resp.json()
 
-            # 2. Get Swap Transaction
-            payload = {
-                "quoteResponse": quote,
-                "userPublicKey": str(keypair.pubkey()),
-                "wrapAndUnwrapSol": True,
-                "priorityFee": {"jitoTipLamports": 1000} # Small tip for speed
-            }
-            swap_resp = await client.post(JUP_SWAP_URL, json=payload)
-            if swap_resp.status_code != 200: return False, f"Swap Build Failed: {swap_resp.text}"
-            
-            swap_data = swap_resp.json()
-            raw_tx = base64.b64decode(swap_data['swapTransaction'])
-            
-            # 3. Sign Transaction
-            # Deserialize the transaction from Jupiter
-            tx = VersionedTransaction.from_bytes(raw_tx)
-            
-            # Create a NEW signed transaction using our keypair and the message from Jupiter
-            signed_tx = VersionedTransaction(tx.message, [keypair])
-            
-            # 4. Send to Blockchain
-            async with AsyncClient(RPC_URL) as sol_client:
-                opts = TxOpts(skip_preflight=True, max_retries=3)
-                resp = await sol_client.send_transaction(signed_tx, opts=opts)
-                return True, str(resp.value)
+                # 2. Swap Tx
+                payload = {
+                    "quoteResponse": quote,
+                    "userPublicKey": str(keypair.pubkey()),
+                    "wrapAndUnwrapSol": True,
+                    "priorityFee": {"jitoTipLamports": 1000}
+                }
+                swap_resp = await client.post(JUP_SWAP_URL, json=payload)
+                if swap_resp.status_code != 200: return False, "Swap Build Failed"
+                
+                swap_data = swap_resp.json()
+                raw_tx = base64.b64decode(swap_data['swapTransaction'])
+                
+                # 3. Sign & Send
+                tx = VersionedTransaction.from_bytes(raw_tx)
+                signed_tx = VersionedTransaction(tx.message, [keypair])
+                
+                async with AsyncClient(RPC_URL) as sol_client:
+                    opts = TxOpts(skip_preflight=True)
+                    resp = await sol_client.send_transaction(signed_tx, opts=opts)
+                    return True, str(resp.value)
 
-    except Exception as e:
-        logging.error(f"Swap Error: {e}")
-        return False, str(e)
+        except Exception as e:
+            logging.warning(f"Swap Attempt {attempt+1} failed: {e}")
+            await asyncio.sleep(1) # Wait before retry
+            
+    return False, "Network Error (3 Retries Failed)"
